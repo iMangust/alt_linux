@@ -813,6 +813,8 @@ backend_version_gate() {
 
 run_backend() {
     local cli="$1" label="$2" user="${3:-}" net="${4:-0}" moz="${5:-0}"
+    # Номер текущей задачи в общем счётчике (защита от двойного run_task_launch)
+    local _alt_sync_task_num=""
 
     if [[ ! -f "$BACKEND_SCRIPT" ]]; then
         gui_dialog error "Не найден alt_sync.sh рядом с GUI-скриптом.
@@ -827,6 +829,19 @@ GUI v$GUI_VERSION требует бэкенд, поддерживающий --lo
     fi
     BACKEND_SCRIPT="$(cd "$(dirname "$BACKEND_SCRIPT")" 2>/dev/null && pwd)/$(basename "$BACKEND_SCRIPT")"
     if [[ $EUID -eq 0 ]]; then
+        # Защита от двойного запуска GUI: если эта root-обёртка получила команду
+        # --run-task повторно (счётчик задач >1), значит задача уже запущена
+        # пользовательской сессией — повторный run_task_launch недопустим
+        # (создаёт второй лог/второй cancel-flag, окно прогресса «теряется»).
+        local _tnow="${_alt_sync_task_num:-}" _tn=""
+        if [[ -z "$_tnow" ]]; then
+            _tn=$(head -1 "${TMPDIR:-/tmp}/alt_sync_tasknum.${ALT_SYNC_TASK_ID:-$$}" 2>/dev/null | tr -dc '0-9') || _tn=""
+            _tnow="${_tn:-}"
+        fi
+        if [[ -n "$_tnow" ]] && (( _tnow > 1 )); then
+            glog "SKIP: повторный вызов задачи из elevated-обёртки (task=${ALT_SYNC_TASK_ID:-—}, номер=$_tnow) — задача уже выполняется основной сессией GUI; выход без дублирования"
+            return 0
+        fi
         ALT_SYNC_NO_ESCALATE=1 ALT_SYNC_ELEVATED=1 \
             run_task_launch "$cli" "$label" "$user" "$net" "$moz"
         return $?
@@ -841,8 +856,19 @@ GUI v$GUI_VERSION требует бэкенд, поддерживающий --lo
         && "${ALT_SYNC_WRAPPER_PID:-}" != "$$" && "${ALT_SYNC_WAS_ELEVATED:-0}" != "1" ]]; then
         local orig_uid; orig_uid=$(id -u)
         [[ -f "$BACKEND_SCRIPT" ]] || BACKEND_SCRIPT="$SELF_DIR/alt_sync.sh"
+        ALT_SYNC_TASK_ID="${ALT_SYNC_TASK_ID:-$$}"
+        export ALT_SYNC_TASK_ID
+        # Инкремент счётчика задач в общем (видимом обеим сторонам) файле:
+        # если elevated-обёртка увидит >1, значит GUI уже запускал эту же задачу —
+        # это повторный вызов и его надо погасить (защита от двойного run_task_launch).
+        local _tnfile="${TMPDIR:-/tmp}/alt_sync_tasknum.${ALT_SYNC_TASK_ID}" _tn=""
+        if [[ -r "$_tnfile" ]]; then _tn=$(head -1 "$_tnfile" 2>/dev/null | tr -dc '0-9'); fi
+        _tn=$(( ${_tn:-0} + 1 ))
+        printf '%s\n' "$_tn" >"$_tnfile" 2>/dev/null || true
+        chmod a+rw "$_tnfile" 2>/dev/null || true
+        _alt_sync_task_num="$_tn"
         local wrapper=(bash "$SELF" --run-task "$cli" "$label" "${user:-}" "$net" "$moz" \
-                       --elevated-marker "--task-id=${ALT_SYNC_TASK_ID:-$$}" \
+                       --elevated-marker "--task-id=${ALT_SYNC_TASK_ID}" \
                        "--gui-self=$SELF" "--backend=$BACKEND_SCRIPT")
         local wrc=0 priv_method=""
         if have sudo && sudo -n true 2>/dev/null; then priv_method="sudo (кэш)"; fi
@@ -856,6 +882,15 @@ GUI v$GUI_VERSION требует бэкенд, поддерживающий --lo
             return 1
         fi
         local xauth_probe="" _xa_owner=""
+        # Если поликит/sudo изотрал XAUTHORITY (или указал на нечитаемый файл),
+        # ищем cookie пользователя по стандартным путям ещё ДО основного пробы.
+        if [[ -z "${XAUTHORITY:-}" || ! -r "${XAUTHORITY:-/nonexistent}" ]]; then
+            for _xa_pre in "/run/user/$(id -u)/xauth" "/run/user/$(id -u)/.Xauthority" \
+                           "$HOME/.Xauthority"; do
+                [[ -n "$_xa_pre" && -f "$_xa_pre" && -r "$_xa_pre" ]] && \
+                    { export XAUTHORITY="$_xa_pre"; glog "XAUTHORITY восстановлен из $_xa_pre (окружение было потеряно при эскалации)"; break; }
+            done
+        fi
         _xa_owner=$(stat -c '%U' "/tmp/.X11-unix/X${DISPLAY#:}" 2>/dev/null)
         [[ -z "$_xa_owner" || "$_xa_owner" == "root" ]] && \
             _xa_owner="${SUDO_USER:-$(id -un "$orig_uid" 2>/dev/null || true)}"
@@ -884,6 +919,15 @@ GUI v$GUI_VERSION требует бэкенд, поддерживающий --lo
         glog "единственная эскалация прав: $priv_method (диалог пароля — ровно один, до старта работ); XAUTHORITY=${xauth_probe:-—}"
         local -a xargs=()
         [[ -n "${DISPLAY:-}" ]]          && xargs+=(--x-display "$DISPLAY")
+        # Fallback-канал для XAUTHORITY: даже если polkit/sudo изотрёт переменные
+        # окружения или файл cookie станет нечитаем, обёртка получит путь к cookie
+        # отдельным аргументом и сможет восстановить его через xauth nlist.
+        if [[ -z "$xauth_probe" ]]; then
+            for _xa_fb in "${XAUTHORITY:-}" "/run/user/$orig_uid/xauth" \
+                          "/run/user/$orig_uid/.Xauthority" "$HOME/.Xauthority"; do
+                [[ -n "$_xa_fb" && -f "$_xa_fb" && -r "$_xa_fb" ]] && { xauth_probe="$_xa_fb"; break; }
+            done
+        fi
         [[ -n "$xauth_probe" ]]          && xargs+=(--x-authority "$xauth_probe")
         [[ -n "${WAYLAND_DISPLAY:-}" ]]  && xargs+=(--wayland-display "$WAYLAND_DISPLAY")
         [[ -n "${XDG_RUNTIME_DIR:-}" || -d "/run/user/$orig_uid" ]] && \
@@ -924,18 +968,59 @@ GUI v$GUI_VERSION требует бэкенд, поддерживающий --lo
 }
 
 progress_health_loop() {
-    local label="$1" logf="$2" t0="$3" tstart="$4" _h=0
+    local label="$1" logf="$2" t0="$3" tstart="$4" _h=0 _tries=0
     while :; do
         kill -0 "${BE_PID:-}" 2>/dev/null || return 0
         if [[ -n "${PP_PID:-}" ]] && ! kill -0 "$PP_PID" 2>/dev/null; then
             glog "FATAL: окно gauge умерло через ${_h}s после старта; stderr: $(head -c 300 "${KD_LAUNCH_LOG:-/dev/null}" 2>/dev/null | tr '\n' ' ')"
-            progress_open "$label" "$logf" "$BE_PID" "$t0" "$tstart" || \
-                glog "повторный open не удался — прогресс только в терминале/логе"
+            # Быстрая смерть окна (<=5с) почти всегда означает «нет доступа к X
+            # из этого процесса» (kdialog cannot connect to X server). Повторный
+            # progress_open в том же окружении обречён — вместо этого немедленно
+            # переключаемся в kdmenu-fallback, чтобы у пользователя остался
+            # видимый интерфейс.
+            if (( _h <= 5 )); then
+                if [[ "${WIDGET_BIN:-}" == kdialog || "${WIDGET_BIN##*/}" == kdialog ]]; then
+                    glog "окно умерело сразу после старта — переключение в режим kdmenu-fallback"
+                    progress_close_window_only
+                    PP_MODE=""
+                    progress_open "$label" "$logf" "$BE_PID" "$t0" "$tstart" || true
+                    return 0
+                fi
+            fi
+            if (( _tries < 1 )); then
+                _tries=$((_tries+1))
+                progress_open "$label" "$logf" "$BE_PID" "$t0" "$tstart" \
+                    || glog "повторный open не удался — прогресс только в терминале/логе"
+                return 0
+            fi
+            glog "окно прогресса недоступно — задача продолжается в фоне; лог: $logf"
+            printf '[Alt Sync] ВНИМАНИЕ: окно прогресса недоступно, задача «%s» продолжается в фоне. Следите за логом: %s\n' "$label" "$logf" >&2
             return 0
         fi
         sleep 1; _h=$((_h+1))
         (( _h % 60 == 0 )) && printf '[Alt Sync] Задача «%s» работает %d мин, окно прогресса недоступно — следите за логом\n' "$label" $((_h/60)) >&2
     done
+}
+
+# Закрывает только окно прогресса (gauge/writer), не трогая cancel-флаги и логи —
+# используется для перехода в kdmenu-fallback после мгновенной смерти окна.
+progress_close_window_only() {
+    [[ "${PP_MODE:-}" == "kdmenu" && -n "${PP_WRITER:-}" ]] && \
+        { pkill -P "$PP_WRITER" 2>/dev/null || true; }
+    if [[ -n "${PP_FIFO:-}" ]]; then
+        printf '#100\n100\n' >&8 2>/dev/null || true
+        exec 8>&- 2>/dev/null || true
+        rm -f "$PP_FIFO" 2>/dev/null || true
+        PP_FIFO=""
+    fi
+    [[ -n "${PP_WRITER:-}" ]] && { kill "$PP_WRITER" 2>/dev/null || true; wait "$PP_WRITER" 2>/dev/null || true; }
+    [[ -n "${PP_WAITER:-}" ]] && { kill "$PP_WAITER" 2>/dev/null || true; }
+    if [[ -n "${PP_PID:-}" ]]; then
+        kill "$PP_PID" 2>/dev/null || true
+        wait "$PP_PID" 2>/dev/null || true
+    fi
+    PP_WRITER=""; PP_PID=""; PP_WAITER=""; PP_MODE=""
+    return 0
 }
 
 run_task_launch() {
@@ -970,7 +1055,45 @@ run_task_launch() {
 
     local -a core=()
     core+=("DISPLAY=${DISPLAY:-:0}")
-    [[ -n "${XAUTHORITY:-}" && -r "$XAUTHORITY" ]] && core+=("XAUTHORITY=$XAUTHORITY")
+    if [[ -n "${XAUTHORITY:-}" && -r "$XAUTHORITY" ]]; then
+        core+=("XAUTHORITY=$XAUTHORITY")
+    elif [[ -n "${DISPLAY:-}" ]] && have xauth; then
+        # root-обёртка часто теряет XAUTHORITY (polkit/sudo подменяют HOME).
+        # Пытаемся восстановить cookie из известных путей, затем — выгрузить
+        # его через `xauth nlist` в общий временный файл, чтобы kdialog от root
+        # смог подключиться к X-серверу пользователя.
+        local _xa_c=""
+        for _xa_c in "/run/user/${ALT_SYNC_ORIG_UID:-$(id -u)}/xauth" \
+                     "/run/user/${ALT_SYNC_ORIG_UID:-$(id -u)}/.Xauthority" \
+                     "/home/${SUDO_USER:-$USER}/.Xauthority" "/root/.Xauthority"; do
+            [[ -n "$_xa_c" && -f "$_xa_c" && -r "$_xa_c" ]] || continue
+            DISPLAY="${DISPLAY}" timeout 5 xauth -f "$_xa_c" nlist "${DISPLAY}" >/dev/null 2>&1 || continue
+            core+=("XAUTHORITY=$_xa_c")
+            export XAUTHORITY="$_xa_c"
+            glog "X-authority для elevated-сессии восстановлен из $_xa_c"
+            break
+        done
+        if [[ -z "${XAUTHORITY:-}" ]]; then
+            local _xa_tmp; _xa_tmp="$(mktemp "${TMPDIR:-/tmp}/alt_sync_xauth_root.XXXXXX")" || _xa_tmp=""
+            if [[ -n "$_xa_tmp" ]]; then
+                chmod 644 "$_xa_tmp" 2>/dev/null || true
+                local _xa_src=""
+                for _xa_src in "/run/user/$(id -u)/xauth" "/run/user/$(id -u)/.Xauthority" \
+                               "/home/${SUDO_USER:-$USER}/.Xauthority" "$HOME/.Xauthority" \
+                               "${ALT_SYNC_XAUTHORITY_ARG:-}"; do
+                    [[ -n "$_xa_src" && -f "$_xa_src" ]] || continue
+                    if DISPLAY="${DISPLAY}" timeout 5 xauth -f "$_xa_src" nlist "${DISPLAY}" >"$_xa_tmp" 2>/dev/null \
+                        && [[ -s "$_xa_tmp" ]]; then
+                        core+=("XAUTHORITY=$_xa_tmp")
+                        export XAUTHORITY="$_xa_tmp"
+                        glog "X-authority выгружен через xauth nlist ($_xa_src -> $_xa_tmp)"
+                        break
+                    fi
+                done
+                [[ ! -s "$_xa_tmp" ]] && rm -f "$_xa_tmp" 2>/dev/null || true
+            fi
+        fi
+    fi
     [[ -n "${WAYLAND_DISPLAY:-}" ]] && core+=("WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
     [[ -n "${XDG_RUNTIME_DIR:-}" ]] && core+=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
     [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && core+=("DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
@@ -1237,9 +1360,25 @@ main() {
                     [[ -n "$rt_val" && -z "${DISPLAY:-}" ]] && export DISPLAY="$rt_val" ;;
                 --x-authority)
                     rt_val="${1:-}"; shift || true
-                    if [[ -n "$rt_val" && -f "$rt_val" ]] \
-                        && { [[ -z "${XAUTHORITY:-}" ]] || [[ ! -r "${XAUTHORITY:-/nonexistent}" ]]; }; then
-                        export XAUTHORITY="$rt_val"
+                    if [[ -n "$rt_val" ]]; then
+                        export ALT_SYNC_XAUTHORITY_ARG="$rt_val"
+                        if { [[ -z "${XAUTHORITY:-}" ]] || [[ ! -r "${XAUTHORITY:-/nonexistent}" ]]; }; then
+                            # polkit часто подменяет HOME/XAUTHORITY; если присланный
+                            # cookie не читается напрямую, выгружаем его через xauth nlist
+                            if [[ -f "$rt_val" && ! -r "$rt_val" ]] && have xauth && [[ -n "${DISPLAY:-}" ]]; then
+                                local _xa_rt; _xa_rt="$(mktemp "${TMPDIR:-/tmp}/alt_sync_xauth_elev.XXXXXX")" || _xa_rt=""
+                                if [[ -n "$_xa_rt" ]] \
+                                    && xauth -f "$rt_val" nlist "${DISPLAY}" >"$_xa_rt" 2>/dev/null && [[ -s "$_xa_rt" ]]; then
+                                    chmod 644 "$_xa_rt" 2>/dev/null || true
+                                    export XAUTHORITY="$_xa_rt"
+                                    glog "X-authority обёртки восстановлен через xauth nlist -> $_xa_rt"
+                                else
+                                    rm -f "$_xa_rt" 2>/dev/null || true
+                                fi
+                            elif [[ -f "$rt_val" ]]; then
+                                export XAUTHORITY="$rt_val"
+                            fi
+                        fi
                     fi ;;
                 --wayland-display)
                     rt_val="${1:-}"; shift || true

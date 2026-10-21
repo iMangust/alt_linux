@@ -59,8 +59,9 @@ if (($# > 0)); then
     unset _early_clean__in _early_clean__out _early_clean__a _early_clean__d _early_clean__l _early_clean__chg
 fi
 
-SCRIPT_VERSION="1.0.36"
+SCRIPT_VERSION="1.0.37"
 
+gui_task_trace_write() {
     [[ "${ALT_SYNC_GUI:-0}" == "1" ]] || return 0
     local _d _f _sd="${ALT_SYNC_SCRIPT_DIR:-$SCRIPT_DIR}"
     for _d in "/run/alt-sync" "/tmp" "$_sd"; do
@@ -93,7 +94,7 @@ gui_task_trace_read() {
               "$_sd/alt_sync_gui.last.log" "$_sd/logs/alt_sync_gui.last.log"; do
         [[ -f "$_f" && -r "$_f" ]] || continue
         _t="$(tail -30 "$_f" 2>/dev/null \
-              | grep -a 'compact: задача cli=' | tail -1 \
+              | grep -a ' задача cli=' | tail -1 \
               | sed -nE 's/.* аргументы=(.*) пользователь=.*/\1/p')" || _t=""
         if [[ -n "${_t// /}" ]]; then printf '%s' "$_t"; return 0; fi
     done
@@ -280,11 +281,11 @@ if [[ $EUID -eq 0 ]]; then
                    "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
             [[ -f "$_lf" ]] || continue
             _lc=$(tail -20 "$_lf" 2>/dev/null \
-                  | grep -a 'compact: задача cli=' | tail -1 \
+                  | grep -a ' задача cli=' | tail -1 \
                   | sed -nE 's/.*cli=([^ ]+) .*/\1/p')
             _la=$(tail -20 "$_lf" 2>/dev/null \
-                  | grep -a 'compact: задача cli=' | tail -1 \
-                  | sed -nE 's/.*cli=[^ ]+ [^ ]*=(.*) [^ ]*=.*/\1/p')
+                  | grep -a ' задача cli=' | tail -1 \
+                  | sed -nE 's/.*cli=[^ ]+ [^ ]*=(.*) пользователь=.*/\1/p')
             [[ -n "$_la" ]] && break
         done
         if [[ -n "$_la" ]]; then
@@ -306,14 +307,14 @@ if [[ $EUID -eq 0 ]]; then
         for _lf in "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
             [[ -f "$_lf" ]] || continue
             _la=$(tail -5 "$_lf" 2>/dev/null \
-                  | grep -a 'compact: форма rc=0' | tail -1 \
+                  | grep -a 'форма rc=0' | tail -1 \
                   | sed -nE 's/.*вывод="([^"|]*)\|.*/\1/p')
             [[ -n "$_la" ]] && break
         done
         for _lf in "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
             [[ -f "$_lf" ]] || continue
             _lt=$(tail -5 "$_lf" 2>/dev/null \
-                  | grep -a 'compact: форма rc=0' | tail -1 \
+                  | grep -a 'форма rc=0' | tail -1 \
                   | sed -nE 's/.*вывод="[^|]*\|([^|]*)\|.*/\1/p')
             [[ -n "$_lt" ]] && break
         done
@@ -359,6 +360,14 @@ elif [[ $EUID -ne 0 ]]; then
             printf '%s INFO: Действие восстановлено из следа задачи (не-root): %s\n' "$(date '+%F %T')" "$*" >&2
         fi
         unset _et
+    elif [[ "${ALT_SYNC_NO_ESCALATE:-}" == "1" && "${ALT_SYNC_GUI:-0}" == "1" ]] && [[ "$(id -u)" != "0" ]]; then
+        # Эскалация уже была выполнена GUI-оболочкой ровно один раз. Повторный
+        # запрос пароля здесь запрещён: если прав не хватает — завершаемся с
+        # явной ошибкой, а не открываем второе окно ввода пароля и не уходим в
+        # невидимое интерактивное меню.
+        printf 'ERROR: Задача требует прав root, но эскалация отключена (ALT_SYNC_NO_ESCALATE=1) и текущий uid=%s.\n' "$(id -u)" >&2
+        printf 'Повторный запрос пароля не выполняется. Запустите вручную: sudo bash %s <действие> [флаги]\n' "${BASH_SOURCE[0]}" >&2
+        exit 78
     elif [[ "${ALT_SYNC_ELEVATED:-}" == "1" && -z "${SUDO_USER:-}" ]]; then
         if [[ "$(id -u)" == "0" ]]; then
             printf 'Предупреждение: SUDO_USER пуст при ALT_SYNC_ELEVATED=1, но эффективный uid=root (0) — продолжаем работу.\n' >&2
@@ -625,11 +634,11 @@ if [[ $EUID -eq 0 ]]; then
                    "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
             [[ -f "$_lf" ]] || continue
             _lc=$(tail -20 "$_lf" 2>/dev/null \
-                  | grep -a 'compact: задача cli=' | tail -1 \
+                  | grep -a ' задача cli=' | tail -1 \
                   | sed -nE 's/.*cli=([^ ]+) .*/\1/p')
             _la=$(tail -20 "$_lf" 2>/dev/null \
-                  | grep -a 'compact: задача cli=' | tail -1 \
-                  | sed -nE 's/.*cli=[^ ]+ [^ ]*=(.*) [^ ]*=.*/\1/p')
+                  | grep -a ' задача cli=' | tail -1 \
+                  | sed -nE 's/.*cli=[^ ]+ [^ ]*=(.*) пользователь=.*/\1/p')
             [[ -n "$_la" ]] && break
         done
         if [[ -n "$_la" ]]; then
@@ -651,14 +660,14 @@ if [[ $EUID -eq 0 ]]; then
         for _lf in "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
             [[ -f "$_lf" ]] || continue
             _la=$(tail -5 "$_lf" 2>/dev/null \
-                  | grep -a 'compact: форма rc=0' | tail -1 \
+                  | grep -a 'форма rc=0' | tail -1 \
                   | sed -nE 's/.*вывод="([^"|]*)\|.*/\1/p')
             [[ -n "$_la" ]] && break
         done
         for _lf in "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
             [[ -f "$_lf" ]] || continue
             _lt=$(tail -5 "$_lf" 2>/dev/null \
-                  | grep -a 'compact: форма rc=0' | tail -1 \
+                  | grep -a 'форма rc=0' | tail -1 \
                   | sed -nE 's/.*вывод="[^|]*\|([^|]*)\|.*/\1/p')
             [[ -n "$_lt" ]] && break
         done
@@ -4996,6 +5005,16 @@ main() {
     if [[ "${ALT_SYNC_GUI:-0}" == "1" ]]; then
         printf '%s ERROR: GUI-оболочка не передала действие бэкенду (пустая команда задачи).\n' "$(date '+%F %T')" >&2
         log "ERROR: GUI mode without action argument — exiting instead of showing invisible interactive menu."
+        return 3
+    fi
+    # Защита от «невидимого» интерактивного меню: если stdin не терминал
+    # (например, /dev/null из GUI-обёртки), read мгновенно завершится ошибкой
+    # и скрипт бесконечно перерисует меню. В таком окружении показывать TUI
+    # бессмысленно — выходим с явной ошибкой вместо зависания без интерфейса.
+    if [[ ! -t 0 && -z "$INPUT_TTY" ]]; then
+        printf '%s ERROR: Интерактивное меню недоступно: stdin не является терминалом.\n' "$(date '+%F %T')" >&2
+        printf 'Запустите скрипт из терминала или передайте действие аргументом, например: sudo bash %s export --yes\n' "${BASH_SOURCE[0]}" >&2
+        log "ERROR: Interactive menu requested without a TTY (stdin=$(readlink -f /proc/self/fd/0 2>/dev/null || echo unknown)) — refusing to hang."
         return 3
     fi
     while true; do
