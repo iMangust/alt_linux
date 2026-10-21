@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.5-console"
+SCRIPT_VERSION="2.0.6-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -263,32 +263,31 @@ read_user_input() {
     if [[ "$NONINTERACTIVE" == "1" || "$INTERACTIVE" != "1" ]]; then
         return 1
     fi
+    # v2.0.6: промпт печатаем ЧЕРЕЗ STDOUT (printf), а не read -p.
+    # Причина: bash пишет «read -p»-промпт в stderr только когда stdin — TTY
+    # И stdout тоже TTY; при обёртках (su/konsole/ssh) это условие иногда
+    # нарушается и приглашение молча исчезает («окно висит, логи пишутся»).
+    # printf виден всегда; вывод идёт через тот же канал, что и меню.
+    [[ -n "$__prompt" ]] && printf '%s' "$__prompt"
     if [[ -n "$INPUT_TTY" ]]; then
         # stdin не терминал — читаем из /dev/tty редиректом
-        if [[ -n "$__prompt" ]]; then
-            IFS= read -r REPLY_OUT -p "$__prompt" <"$INPUT_TTY" || return 1
-        else
-            IFS= read -r REPLY_OUT <"$INPUT_TTY" || return 1
-        fi
+        IFS= read -r REPLY_OUT <"$INPUT_TTY" || return 1
     else
         # stdin — терминал: read без редиректа читает прямо с tty
-        if [[ -n "$__prompt" ]]; then
-            IFS= read -r REPLY_OUT -p "$__prompt" || return 1
-        else
-            IFS= read -r REPLY_OUT || return 1
-        fi
+        IFS= read -r REPLY_OUT || return 1
     fi
     return 0
 }
 
-# Дублирование вывода в лог реализовано в КОНЦЕ файла (точка входа): скрипт
-# перезапускает сам себя (флаг ALT_SYNC_LOGPIPE=1 защищает от рекурсии) внутри
-# конвейера sed|tee. Свой stdout/stderr текущий процесс НЕ перехватывает через
-# «exec > >(...)», и «exec 3</dev/tty» нигде не делается: process substitution
-# перехватывала дескрипторы и конфликтовала с терминальным чтением — read
-# возвращал EIO («ошибка чтения: 0»), окно выглядело зависшим при живых логах.
-# Внутри перезапуска stdin наследуется как есть (TTY), поэтому read_user_input
-# читает с терминала штатно.
+# ЛОГИРОВАНИЕ ВЫВОДА (v2.0.5-fix, финальная схема): интерактивный вывод идёт
+# НАПРЯМУЮ в унаследованный TTY — stdout/stderr НЕ перехватываются вообще
+# (ни «exec > >(sed|tee)», ни конвейером вокруг перезапускаемого себя). Оба
+# прежних способа ломали терминал: process substitution конфликтовала с
+# чтением (read → EIO), а pipe+tee буферизовал весь экран («окно висит, логи
+# пишутся»). В журнале $LOG_FILE надёжно остаются все служебные записи log()
+# (INIT/STEP/INFO/WARN/ERROR/FATAL) — они пишутся сюда напрямую; пользователь-
+# ский экранный вывод в TTY не дублируется. Неинтерактивный запуск (без TTY)
+# пишет весь stdout/stderr только в лог — см. «Точку входа» в конце файла.
 
 export -n INPUT_TTY 2>/dev/null || true
 
@@ -663,10 +662,23 @@ if ! touch "$LOCK_FILE" 2>/dev/null; then
     die "Не удалось создать lock-файл: $LOCK_FILE"
 fi
 
-exec 9>"$LOCK_FILE"
-if (( HAVE_FLOCK == 1 )); then
+# v2.0.5-fix: замок наследуется дочернему процессу log-конвейера через fd 9 →
+# повторный flock -n в дочке всегда падал с «Другой экземпляр уже запущен».
+# Если fd 9 уже открыт на этот же файл замка (наследник родительского
+# экземпляра) — блокировка унаследована, повторно захватывать не нужно.
+_as_lock_is_fd9() {
+    local __t
+    __t="$(readlink -f /proc/self/fd/9 2>/dev/null)" || return 1
+    [[ -n "$__t" && "$__t" == "$(readlink -f "$LOCK_FILE" 2>/dev/null || echo "$LOCK_FILE")" ]]
+}
+
+if _as_lock_is_fd9; then
+    log "INFO: Замок унаследован от родительского процесса (fd 9 = $LOCK_FILE) — повторный захват пропущен."
+elif (( HAVE_FLOCK == 1 )); then
+    exec 9>"$LOCK_FILE"
     flock -n 9 || die "Другой экземпляр alt_sync уже запущен (замок: $LOCK_FILE). Дождитесь его завершения."
 else
+    exec 9>"$LOCK_FILE"
     printf '%s\n' "$$" >&9 2>/dev/null || true
     log "WARN: flock недоступен — блокировка от параллельного запуска ослаблена (PID-файл: $LOCK_FILE)."
 fi
@@ -3768,7 +3780,7 @@ validate_user() {
         return 1
     fi
 
-    HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"
     if [[ -z "$HOME_DIR" || ! -d "$HOME_DIR" ]]; then
         step_warn "Домашний каталог не найден для пользователя: $TARGET_USER"
         return 1
@@ -3780,7 +3792,7 @@ validate_user() {
 
 choose_target_user() {
     local default_user
-    default_user="$(detect_default_user)"
+    default_user="$(detect_default_user || true)"
 
     if [[ "$NONINTERACTIVE" == "1" ]]; then
         TARGET_USER="${ALT_SYNC_TARGET_USER:-$default_user}"
@@ -3847,7 +3859,7 @@ prepare_export() {
         if [[ -n "${ALT_SYNC_TARGET_USER:-}" ]]; then
             TARGET_USER="$ALT_SYNC_TARGET_USER"
         else
-            TARGET_USER="$(detect_default_user)"
+            TARGET_USER="$(detect_default_user || true)"
         fi
         if [[ -z "$TARGET_USER" ]] || ! validate_user; then
             step_warn "Не задан/недействителен пользователь профиля (ALT_SYNC_TARGET_USER) — профиль пропущен."
@@ -3855,7 +3867,7 @@ prepare_export() {
             OPT_BACKUP_USER=0
             OPT_SKIP_MOZILLA=1
         else
-            HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6)"; HOME_DIR="${HOME_DIR:-/home/$TARGET_USER}"
+            HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"; HOME_DIR="${HOME_DIR:-/home/$TARGET_USER}"
             TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
         fi
         return 0
@@ -3908,7 +3920,7 @@ prepare_import_interactive() {
         OPT_ALLOW_NODEPS=0
         if [[ -n "${ALT_SYNC_TARGET_USER:-}" ]] && validate_user; then
             TARGET_USER="$ALT_SYNC_TARGET_USER"
-            HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6)"; HOME_DIR="${HOME_DIR:-/home/$TARGET_USER}"
+            HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"; HOME_DIR="${HOME_DIR:-/home/$TARGET_USER}"
             TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
             OPT_RESTORE_USER=1
         else
@@ -3993,7 +4005,7 @@ prepare_import_offline() {
         OPT_ALLOW_NODEPS=0
         if [[ -n "${ALT_SYNC_TARGET_USER:-}" ]] && validate_user; then
             TARGET_USER="$ALT_SYNC_TARGET_USER"
-            HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6)"; HOME_DIR="${HOME_DIR:-/home/$TARGET_USER}"
+            HOME_DIR="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"; HOME_DIR="${HOME_DIR:-/home/$TARGET_USER}"
             TARGET_GROUP="$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
             OPT_RESTORE_USER=1
         else
@@ -4092,7 +4104,7 @@ show_menu() {
 
     if deps_cache_available; then
         local nrpm
-        nrpm="$(find "$DEPS_CACHE_DIR" -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l)"
+        nrpm="$(find "$DEPS_CACHE_DIR" -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l || true)"
         printf '%b\n' "  ${BOLD}Офлайн-кэш зависимостей:${NC} ${GREEN}${nrpm} RPM${NC} ($DEPS_CACHE_DIR)"
     else
         printf '%b\n' "  ${BOLD}Офлайн-кэш зависимостей:${NC} ${YELLOW}отсутствует${NC} (на эталоне выполните п.7 или: sudo bash $SELF fetch-deps)"
@@ -4100,8 +4112,8 @@ show_menu() {
 
     if [[ -d "$PACKAGES_DIR" ]]; then
         local npkg nfree
-        npkg="$(find "$PACKAGES_DIR" -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l)"
-        nfree="$(df -Pm "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+        npkg="$(find "$PACKAGES_DIR" -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l || true)"
+        nfree="$(df -Pm "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)"
         printf '%b\n' "  ${BOLD}Пакеты в бэкапе:${NC} ${npkg:-0} RPM ${CYAN}(свободно на диске: ${nfree:-?} МБ)${NC}"
     else
         printf '%b\n' "  ${BOLD}Пакеты в бэкапе:${NC} ещё не созданы (выполните экспорт — п.1 или п.2)"
@@ -4109,7 +4121,7 @@ show_menu() {
 
     if [[ -r "$MACHINE_ID_FILE" ]]; then
         local cur stor
-        cur="$(generate_machine_id)"
+        cur="$(generate_machine_id || true)"
         stor="$(tr -d '\r\n ' < "$MACHINE_ID_FILE" 2>/dev/null || true)"
         if [[ "$cur" == "$stor" ]]; then
             printf '%b\n' "  🔒 Статус: ${GREEN}Эталон совпадает с этим железом${NC}"
@@ -4151,8 +4163,8 @@ create_desktop_shortcut() {
         return 1
     fi
     if [[ $EUID -ne 0 ]]; then
-        target_uid="$(id -u)"
-        target_user="$(id -un)"
+        target_uid="$(id -u || true)"
+        target_user="$(id -un || true)"
     fi
     # fallback: если uid не определён (например, запуск через su без SUDO_UID),
     # берём uid найденного пользователя
@@ -4165,7 +4177,7 @@ create_desktop_shortcut() {
     fi
     local home_dir
     if [[ -n "$target_user" ]]; then
-        home_dir="$(getent passwd "$target_user" | cut -d: -f6)"
+        home_dir="$(getent passwd "$target_user" | cut -d: -f6 || true)"
     else
         home_dir="$HOME"
     fi
@@ -4194,7 +4206,7 @@ create_desktop_shortcut() {
     # Путь экранирован через printf %q — корректно работает даже если он
     # содержит пробелы или спецсимволы. Флаг NO_AUTOINSTALL НЕ подставляется:
     # при отсутствии зависимостей скрипт сам спросит, установить ли их.
-    local run_cmd="env ALT_SYNC_LOGPIPE= bash '${SELF_NO_ESCAPE}'"
+    local run_cmd="bash ${SELF_NO_ESCAPE}"
 
     local launch_line
     case "$term_exec" in
@@ -4269,7 +4281,7 @@ system_summary() {
     printf '\n%b\n' "${BOLD}${CYAN}━━━ Сводка системы ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     printf '  Хост:              %s\n' "$(hostname 2>/dev/null || echo '?')"
     local osname
-    osname="$(grep -m1 PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)"
+    osname="$(grep -m1 PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 || true)"
     printf '  ОС:                %s\n' "${osname:-?}"
     printf '  Ядро:              %s\n' "$(uname -r 2>/dev/null || echo '?')"
     printf '  Пользователь:      %s (uid=%s)\n' "$(id -un)" "$(id -u)"
@@ -4284,28 +4296,31 @@ system_summary() {
     printf '  Последний лог:     %s\n' "$LOG_DIR/alt_sync_latest.log"
     local ncpu ram diskfree
     ncpu="$(nproc 2>/dev/null || echo '?')"
-    ram="$(free -h 2>/dev/null | awk '/^Mem:/{print $2"/"$7}')"
-    diskfree="$(df -Ph "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+    ram="$(free -h 2>/dev/null | awk '/^Mem:/{print $2"/"$7}' || true)"
+    # «|| true» обязательны: под set -e непустой вывод awk НЕ гарантирует rc=0,
+    # а пустая команда (df/free отсутствуют) с rc=1 убивала весь скрипт прямо
+    # здесь — окно закрывалось сразу после «Сводки системы».
+    diskfree="$(df -Ph "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)"
     printf '  CPU: %s ядер | RAM всего/свободно: %s | свободно на диске бэкапа: %s\n' \
         "$ncpu" "${ram:-?}" "${diskfree:-?}"
     if command -v nmcli >/dev/null 2>&1; then
         local nst
-        nst="$(nmcli -t -f STATE networking status 2>/dev/null | head -1)"
+        nst="$(nmcli -t -f STATE networking status 2>/dev/null | head -1 || true)"
         printf '  Сеть (NetworkManager): %s\n' "${nst:-неизвестно}"
     fi
     if [[ -d "$PACKAGES_DIR" ]]; then
         local npkg nbak
-        npkg="$(find "$PACKAGES_DIR" -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l)"
-        nbak="$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)"
+        npkg="$(find "$PACKAGES_DIR" -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l || true)"
+        nbak="$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1 || true)"
         printf '  Бэкап:             %s RPM, общий размер ~%s\n' "$npkg" "${nbak:-?}"
     fi
     if deps_cache_available; then
         local ndep
-        ndep="$(find "$DEPS_CACHE_DIR" -maxdepth 1 \( -name '*.rpm' -o -name '*.deb' \) 2>/dev/null | wc -l)"
+        ndep="$(find "$DEPS_CACHE_DIR" -maxdepth 1 \( -name '*.rpm' -o -name '*.deb' \) 2>/dev/null | wc -l || true)"
         printf '  Офлайн-кэш:        %s пакетов (%s)\n' "$ndep" "$DEPS_CACHE_DIR"
     fi
     if [[ -r "$MACHINE_ID_FILE" ]]; then
-        printf '  Маркер эталона:    %s\n' "$(head -c 64 "$MACHINE_ID_FILE" 2>/dev/null)"
+        printf '  Маркер эталона:    %s\n' "$(head -c 64 "$MACHINE_ID_FILE" 2>/dev/null || true)"
     fi
     printf '  Версия скрипта:    %s\n' "$SCRIPT_VERSION"
     printf '%b\n' "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -4640,9 +4655,15 @@ main() {
         show_menu
 
         local choice=""
-        # v2.0.5: читаем через read_user_input (stdin=TTY или /dev/tty —
-        # см. начало файла). Прямой «read ... </dev/tty» давал EIO после su.
-        if ! read_user_input "  Выбор [0-9]: "; then
+        # v2.0.6: промпт печатается ОТДЕЛЬНО (printf), затем read БЕЗ -p.
+        # Причина: bash при «read -p'...'» пишет промпт в stderr только когда
+        # stdin — TTY И stdout тоже TTY; при запуске из konsole/su иногда
+        # stdout оказывается не-TTY — и приглашение молча пропадало, окно
+        # выглядело «зависшим». printf гарантированно виден всегда.
+        # Читает read_user_input: stdin=TTY или /dev/tty (прямой
+        # «read ... </dev/tty» после su давал EIO).
+        printf '  Выбор [0-9]: '
+        if ! read_user_input ""; then
             echo
             exit 0
         fi
@@ -4723,32 +4744,20 @@ main() {
 }
 
 # ─── Точка входа ──────────────────────────────────────────────────────────────
-# v2.0.5: дублирование вывода в лог — ЧИСТЫМ конвейером вокруг самого скрипта
-# (переэкзек себя), а НЕ «exec > >(…|tee…)»: process substitution оставляла
-# фоновый concheck и ломала терминальное чтение (read → EIO, «зависшее» окно
-# при пишущихся логах). Внутри конвейера stdin наследуется как есть (TTY),
-# поэтому read_user_input читает с терминала штатно.
-# Дочерний процесс наследует stdin КАК ЕСТЬ (TTY) — никакого перехвата его
-# дескрипторов; ANSI-коды вырезаются sed перед tee. Редирект stderr —
-# корректным синтаксисом «>… 2>&1» (запись «prog 2>&1 | tee» применила бы
-# редирект ПОСЛЕ построения конвейера, и stderr миновал бы tee).
-# ВАЖНО: stderr оборачивается редиректом ВО ВСЁЙ группы «{…} 2>&1», иначе
-# stderr дочернего процесса пошёл бы напрямую в терминал, минуя sed|tee.
-if [[ "${ALT_SYNC_LOGPIPE:-}" != "1" ]] && [[ "$INTERACTIVE" == "1" ]] && have_cmd tee && have_cmd sed; then
-    export ALT_SYNC_LOGPIPE=1
-    {
-        {
-            bash "${BASH_SOURCE[0]}" "$@" \
-                | sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\x1b\[K//g' \
-                | tee -a "$LOG_FILE"
-        }
-    } 2>&1
-    _as_rc=${PIPESTATUS[0]}
-    # дописываем код возврата дочернего процесса в лог
-    printf '%s INFO: Завершение работы (exit code %s)\n' "$(date '+%F %T')" "$_as_rc" >> "$LOG_FILE" 2>/dev/null || true
-    exit "$_as_rc"
-elif [[ "${ALT_SYNC_LOGPIPE:-}" != "1" ]] && [[ "$INTERACTIVE" != "1" ]]; then
-    # Неинтерактивно: весь вывод только в лог.
+# v2.0.5-fix (итоговая схема логирования): НИКАКИХ обёрток над всем скриптом.
+# История проблем:
+#   a) exec > >(sed|tee >&3) 2>&1 + exec 3>&1 — перехват дескрипторов ломал
+#      чтение с терминала (read → EIO), окно «висело» при пишущемся логе;
+#   b) bash "$SELF" | sed | tee — дочерний процесс писал только в pipe, tee
+#      буферизовал поблочно: терминал молчал («окно висит, логи пишутся»),
+#      плюс замок flock наследовался через fd 9 → «Другой экземпляр запущен».
+# Правильно: интерактивный вывод идёт НАПРЯМУЮ в унаследованный TTY (stdout/
+# stderr не редиректятся вообще), stdin не трогается. В журнале остаются все
+# служебные строки log()/step_*/info/warn (они пишутся в $LOG_FILE напрямую).
+# Неинтерактивный запуск (CLI из cron/GUI-обёртки без TTY) — весь вывод в лог.
+if [[ "${ALT_SYNC_LOGPIPE:-}" != "1" ]] && [[ "$INTERACTIVE" != "1" ]]; then
+    # Неинтерактивно: stdout+stderr только в лог (в файле нет ANSI-кодов,
+    # т.к. цвета определены пусто для не-TTY stdout).
     exec >> "$LOG_FILE" 2>&1
 fi
 
