@@ -235,14 +235,21 @@ else
     fi
 fi
 INPUT_TTY=""
-if [[ -t 0 ]] && [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
+# ВАЖНО: определяем доступность /dev/tty НЕЗАВИСИМО от «-t 0». При запуске
+# через ярлык вида «konsole -e bash -lc "su -c '...'"» su передаёт stdin как
+# есть, но в некоторых конфигурациях (другие терминалы/обёртки) stdin может
+# не быть терминалом, тогда как /dev/tty полностью доступен. Прежняя проверка
+# «[[ -t 0 ]] && ...» в этом случае обнуляла INPUT_TTY, ask_yes_no уходил в
+# «неинтерактивный» режим и молча отвечал сам — пользователь не видел ни
+# приветствия, ни меню, хотя скрипт работал и писал логи («зависшее окно»).
+if [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
     INPUT_TTY="/dev/tty"
 fi
-if [[ -n "$INPUT_TTY" ]]; then
-    { exec 3<"$INPUT_TTY"; } 2>/dev/null || { exec 3</dev/null; } 2>/dev/null || true
-else
-    { exec 3</dev/null; } 2>/dev/null || true
-fi
+# ВАЖНО: здесь НЕЛЬЗЯ делать «exec 3</dev/tty». Выше (строка ~227) дескриптор 3
+# уже занят каналом вывода в терминал («exec 3>&1», используется конвейером
+# tee для показа меню). Переназначение fd 3 на файл ввода ломало вывод:
+# окно терминала «зависало» (меню не печаталось), хотя логи продолжали писаться.
+# Чтение ввода везде идёт через read ... <"$INPUT_TTY", отдельный fd не нужен.
 export INPUT_TTY
 
 _finish_log() {
@@ -320,6 +327,14 @@ gui_cancel_check() {
     exit 130
 }
 
+# Возвращает 0, если пользователь нажал Ctrl+C (используется в progress_bar
+# как контрольная точка отмены). Раньше эта функция вызывалась, но нигде не
+# была определена — при первом же вызове progress_bar скрипт падал с
+# «command not found» под set -e.
+gui_cancel_requested() {
+    (( CANCELLED_BY_USER ))
+}
+
 step_ok() {
     printf "${GREEN}  ✅ %s${NC}\n" "${1:-Готово}"
     log "OK: ${1:-Готово}"
@@ -361,7 +376,11 @@ ask_yes_no() {
 
     printf '%s %s ' "$prompt" "$hint"
 
-    if [[ "$NONINTERACTIVE" == "1" ]] || [[ ! -t 0 ]]; then
+    # ВАЖНО: проверять нужно сам INPUT_TTY, а не «-t 0»: после «su -c» или в
+    # части GUI-обёрток stdin может не быть терминалом (-t 0 ложен), тогда как
+    # /dev/tty доступен. Из-за прежней проверки скрипт уходил в «неинтерактивный
+    # режим» и молча отвечал сам — пользователь не видел ни меню, ни вопросов.
+    if [[ "$NONINTERACTIVE" == "1" ]] || [[ -z "$INPUT_TTY" ]]; then
         local eff="$def"
         if [[ "${ALT_SYNC_ASSUME_YES:-0}" == "1" ]]; then
             eff="y"
@@ -375,7 +394,7 @@ ask_yes_no() {
     fi
 
     local rc=0 ans_is_eof=0
-    if ! IFS= read -r ans; then
+    if ! IFS= read -r ans <"$INPUT_TTY"; then
         rc=$?
         printf '\n'
         if (( rc > 1 )); then
@@ -404,7 +423,7 @@ ask_yes_no() {
             fi
             ;;
         *)
-            if (( ans_is_eof == 0 )) && [[ -t 0 ]]; then
+            if (( ans_is_eof == 0 )); then
                 printf '%b\n' "${YELLOW}  Введите «да»/«нет» (y/n), пустая строка — по умолчанию.${NC}"
                 ask_yes_no "$prompt" "$def"
                 return $?
@@ -435,7 +454,12 @@ progress_bar() {
         pct=100
     fi
 
-    gui_cancel_requested && gui_cancel_check "во время: $label"
+    # «&& gui_cancel_check ...» под set -e опасен: когда отмены нет,
+    # gui_cancel_requested возвращает 1 и составная команда завершается с
+    # ошибкой. Используем явный if — безопасно при любом раскладе.
+    if gui_cancel_requested; then
+        gui_cancel_check "во время: $label"
+    fi
 
     if (( pct != LAST_PROGRESS_PCT )); then
         log "$label $current/$total (${pct}%)"
@@ -566,7 +590,14 @@ if (( __arch_found )); then
     for _cmd in "${MISSING_OPTIONAL_COMMANDS[@]}"; do
         case "$_cmd" in 7z|7za|unar|bsdtar|unrar) ;; *) __kept+=("$_cmd") ;; esac
     done
-    MISSING_OPTIONAL_COMMANDS=("${__kept[@]:-}")
+    # Если после фильтра список пуст, присваивание с «:-» создавало бы один
+    # пустой элемент — тогда ${#...} = 1 и скрипт ложно считал бы, что чего-то
+    # не хватает. Присваиваем только непустой массив.
+    if ((${#__kept[@]} > 0)); then
+        MISSING_OPTIONAL_COMMANDS=("${__kept[@]}")
+    else
+        MISSING_OPTIONAL_COMMANDS=()
+    fi
     unset __kept
 fi
 unset __arch_found _a
@@ -608,8 +639,10 @@ EPSON_PKGS=(
 
 PANTUM_PKGS=(
     epm
-    whiptail
-    newt
+    # ВАЖНО: в ALT Linux пакет называется «libnewt» (не «newt»), а whiptail
+    # входит в пакет «newt»/«libnewt» — некорректные имена приводили к
+    # гарантированно падающей apt-get install в install_special_packages.
+    libnewt
 )
 
 CRYPTO_PKGS=(
@@ -3068,15 +3101,32 @@ install_pantum() {
 
     info "Устанавливаю Pantum через epm play pantum..."
 
-    if epm play --yes pantum </dev/null >>"$LOG_FILE" 2>&1; then
+    # Эталонная инструкция: «apt-get update && apt-get install epm», затем
+    # «epm play pantum» — без флагов --yes/-y (epm play их не поддерживает и
+    # считал бы «--yes» именем скрипта). Скрипт play сам скачивает драйверы;
+    # запросы подтверждения закрываем пустым вводом.
+
+    # Сначала обновляем системные списки (по инструкции эталона), иначе свежая
+    # установка epm может отсутствовать в локальном индексе APT, а повторный
+    # вызов update_system_lists_if_needed без флага ничего не делает.
+    if (( OPT_NETWORK_ENABLED == 1 )); then
+        SYSTEM_LISTS_UPDATED=0
+    fi
+    update_system_lists_if_needed
+
+    if epm play pantum </dev/null >>"$LOG_FILE" 2>&1; then
         return 0
     fi
 
-    if epm play -y pantum </dev/null >>"$LOG_FILE" 2>&1; then
+    # Повтор с обновлением списков (на случай устаревшего индекса репозитория)
+    update_system_lists_if_needed
+    if epm play pantum </dev/null >>"$LOG_FILE" 2>&1; then
         return 0
     fi
 
-    step_warn "Не удалось установить Pantum в неинтерактивном режиме."
+    step_warn "Не удалось установить Pantum через epm play."
+    step_warn "Выполните вручную от root: apt-get update && apt-get install epm && epm play pantum"
+    step_warn "Затем установите принтер через «Параметры печати»."
 
     return 0
 }
@@ -4020,9 +4070,12 @@ show_menu() {
 }
 
 pause_console() {
-    [[ -t 0 ]] || return 0
+    # Проверять нужно INPUT_TTY, а не «-t 0»: после «su -c» stdin может не быть
+    # терминалом, тогда как /dev/tty доступен. Без паузы экран мгновенно
+    # прокручивался и меню перерисовывалась в цикле — окно выглядело «зависшим».
+    [[ -n "$INPUT_TTY" ]] || return 0
     printf '\n%s' "  Нажмите ENTER для возврата в меню…"
-    IFS= read -r _ || true
+    IFS= read -r _ <"$INPUT_TTY" || true
 }
 
 # ─── Ярлык в графической оболочке (пункт меню 9) ──────────────────────────────
@@ -4409,14 +4462,21 @@ main() {
         shift
     done
 
+    # ── Приветствие показываем СРАЗУ, до любых проверок зависимостей, чтобы
+    # пользователь сразу видел меню/информацию в терминале (раньше при
+    # ALT_SYNC_NO_AUTOINSTALL=1 вывод уходил только в лог, и окно казалось
+    # «зависшим»).
+    printf 'alt_sync v%s | SELF=%s | BACKUP_DIR=%s | INPUT_TTY=%s\n' \
+        "$SCRIPT_VERSION" "$SELF" "$BACKUP_DIR" "${INPUT_TTY:-<нет>}"
+
     if ((${#MISSING_BOOTSTRAP[@]} > 0)) || ((${#MISSING_OPTIONAL_COMMANDS[@]} > 0)); then
         local net_allowed=0
         if [[ "${ALT_SYNC_NO_AUTOINSTALL:-0}" == "1" ]]; then
             log "INFO: ALT_SYNC_NO_AUTOINSTALL=1 — автоустановка зависимостей отключена; использую доступные механизмы."
         elif [[ "${ALT_SYNC_ALLOW_NET:-0}" == "1" ]]; then
             net_allowed=1
-        elif [[ "$NONINTERACTIVE" != "1" && -t 0 ]]; then
-            if ask_yes_no "Не хватает зависимостей (${MISSING_BOOTSTRAP[*]:-}${MISSING_OPTIONAL_COMMANDS[*]:-}). Установить их из репозитория? (нужен интернет)" y; then
+        elif [[ "$NONINTERACTIVE" != "1" && -n "$INPUT_TTY" ]]; then
+            if ask_yes_no "Не хватает зависимостей (${MISSING_BOOTSTRAP[*]:-} ${MISSING_OPTIONAL_COMMANDS[*]:-}). Установить их из репозитория? (нужен интернет)" y; then
                 net_allowed=1
             fi
         else
@@ -4480,11 +4540,15 @@ main() {
         return "$rc"
     fi
 
-    # Защита от «невидимого» интерактивного меню: если stdin не терминал
-    # (например, /dev/null из GUI-обёртки), read мгновенно завершится ошибкой
-    # и скрипт бесконечно перерисует меню. В таком окружении показывать TUI
-    # бессмысленно — выходим с явной ошибкой вместо зависания без интерфейса.
-    if [[ ! -t 0 && -z "$INPUT_TTY" ]]; then
+    # Защита от «невидимого» интерактивного меню: если stdin не терминал и
+    # /dev/tty недоступен (например, /dev/null из GUI-обёртки), read мгновенно
+    # завершится ошибкой и скрипт бесконечно перерисует меню. В таком
+    # окружении показывать TUI бессмысленно — выходим с явной ошибкой вместо
+    # зависания без интерфейса.
+    # ВАЖНО: раньше здесь было «[[ ! -t 0 && -z "$INPUT_TTY" ]]», но INPUT_TTY
+    # сам вычисляется через «-t 0», поэтому при запуске через «su -c» из
+    # konsole условие было ложным и управление всё равно уходило в die/.
+    if [[ ! -t 0 ]] && [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
         printf '%s ERROR: Интерактивное меню недоступно: stdin не является терминалом.\n' "$(date '+%F %T')" >&2
         printf 'Запустите скрипт из терминала или передайте действие аргументом, например: sudo bash %s export --yes\n' "${BASH_SOURCE[0]}" >&2
         log "ERROR: Interactive menu requested without a TTY (stdin=$(readlink -f /proc/self/fd/0 2>/dev/null || echo unknown)) — refusing to hang."
