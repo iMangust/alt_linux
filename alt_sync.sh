@@ -17,204 +17,9 @@ if [[ -z "${ALT_SYNC_CRLF_FIXED:-}" ]] && LC_ALL=C grep -q $'\r' "${BASH_SOURCE[
     ALT_SYNC_CRLF_FIXED=1 exec bash "${BASH_SOURCE[0]}" "$@"
 fi
 
-AS_HUB_DIRS=()
-for _hd in "/run/alt-sync" "${TMPDIR:-/tmp}/alt-sync-hub.$(id -u)"; do
-    mkdir -p "$_hd" 2>/dev/null && chmod 777 "$_hd" 2>/dev/null \
-        && [[ -w "$_hd" ]] && AS_HUB_DIRS+=("$_hd")
-done
-if ((${#AS_HUB_DIRS[@]} == 0)); then
-    AS_HUB_DIRS=("$(mktemp -d "${TMPDIR:-/tmp}/alt-sync-hub.XXXXXX")")
-fi
-AS_ARGS_FILE="${AS_HUB_DIRS[0]}/args.txt"
-AS_READY_FILE="${AS_HUB_DIRS[0]}/ready"
-AS_LOGBEACON="${AS_HUB_DIRS[0]}/log.path"
-export AS_ARGS_FILE AS_READY_FILE AS_LOGBEACON
-
 set -euo pipefail
 
-if (($# > 0)); then
-    _early_clean__in=("$@"); _early_clean__out=(); _early_clean__chg=0
-    for _early_clean__a in "${_early_clean__in[@]}"; do
-        if [[ "$_early_clean__a" =~ ^[A-Za-z0-9+/=]{8,}$ ]] \
-           && [[ ! "$_early_clean__a" =~ ^(export|import|cryptopro|verify|fetch-deps)$ ]]; then
-            _early_clean__d="$(printf '%s' "$_early_clean__a" | base64 -d 2>/dev/null)" || _early_clean__d=""
-            if [[ -n "$_early_clean__d" && "$(printf '%s\n' "$_early_clean__d" | base64 | tr -d '\n')" == "$_early_clean__a" ]]; then
-                while IFS= read -r _early_clean__l; do
-                    [[ -z "$_early_clean__l" ]] && continue
-                    _early_clean__out+=("$_early_clean__l")
-                done <<<"$_early_clean__d"
-                _early_clean__chg=1
-                continue
-            fi
-            printf '%s WARN: Мусорный аргумент «%.24s…» (осколок env-релея) выброшен на раннем этапе.\n' \
-                "$(date '+%F %T')" "$_early_clean__a" >&2
-            _early_clean__chg=1
-            continue
-        fi
-        _early_clean__out+=("$_early_clean__a")
-    done
-    if (( _early_clean__chg )); then
-        set -- ${_early_clean__out[@]+"${_early_clean__out[@]}"}
-    fi
-    unset _early_clean__in _early_clean__out _early_clean__a _early_clean__d _early_clean__l _early_clean__chg
-fi
-
-SCRIPT_VERSION="1.0.37"
-
-gui_task_trace_write() {
-    [[ "${ALT_SYNC_GUI:-0}" == "1" ]] || return 0
-    local _d _f _sd="${ALT_SYNC_SCRIPT_DIR:-$SCRIPT_DIR}"
-    for _d in "/run/alt-sync" "/tmp" "$_sd"; do
-        mkdir -p "$_d" 2>/dev/null || continue
-        printf 'TASK %s\n' "$*" >"$_d/.alt_sync_task" 2>/dev/null && \
-            chmod a+rw "$_d/.alt_sync_task" 2>/dev/null || true
-    done
-    unset _d _f _sd
-    return 0
-}
-
-gui_task_trace_read() {
-    local _t="" _f _sd="${ALT_SYNC_SCRIPT_DIR:-$SCRIPT_DIR}"
-    if [[ -n "${ALT_SYNC_ARGS_B64:-}" ]]; then
-        _t="$(printf '%s' "$ALT_SYNC_ARGS_B64" | base64 -d 2>/dev/null)" || _t=""
-        if [[ -n "$_t" ]]; then printf '%s' "$_t" | tr '\n' ' '; return 0; fi
-    fi
-    if [[ -n "${ALT_SYNC_ARGS_FILE:-}" && -r "${ALT_SYNC_ARGS_FILE:-/nonexistent}" ]]; then
-        _t="$(tr '\n' ' ' <"$ALT_SYNC_ARGS_FILE" 2>/dev/null)" || _t=""
-        if [[ -n "${_t// /}" ]]; then printf '%s' "$_t"; return 0; fi
-    fi
-    for _f in "/run/alt-sync/.alt_sync_task" "/tmp/.alt_sync_task" "$_sd/.alt_sync_task" \
-              "${TMPDIR:-/tmp}/.alt_sync_task"; do
-        [[ -f "$_f" && -r "$_f" ]] || continue
-        _t="$(head -1 "$_f" 2>/dev/null)" || _t=""
-        _t="${_t#TASK }"
-        if [[ -n "${_t// /}" ]]; then printf '%s' "$_t"; return 0; fi
-    done
-    for _f in "/run/alt-sync/gui.last.log" "/tmp/alt-sync-gui.last.log" \
-              "$_sd/alt_sync_gui.last.log" "$_sd/logs/alt_sync_gui.last.log"; do
-        [[ -f "$_f" && -r "$_f" ]] || continue
-        _t="$(tail -30 "$_f" 2>/dev/null \
-              | grep -a ' задача cli=' | tail -1 \
-              | sed -nE 's/.* аргументы=(.*) пользователь=.*/\1/p')" || _t=""
-        if [[ -n "${_t// /}" ]]; then printf '%s' "$_t"; return 0; fi
-    done
-    printf ''
-}
-
-if [[ "${ALT_SYNC_GUI:-0}" == "1" && "$EUID" -ne 0 && -z "${ALT_SYNC_ALLOW_SELF_ELEVATE:-}" ]]; then
-    printf '%s ERROR: Бэкенд запущен без прав root в GUI-режиме (повышение должно выполнить ДО запуска).\n' "$(date '+%F %T')" >&2
-    printf 'Запустите alt_sync_gui.sh v1.0.8 или выше либо вручную: sudo bash %s\n' "${BASH_SOURCE[0]}" >&2
-    exit 78
-fi
-
-askpass_get_password() {
-    local prompt="${1:-Введите пароль:}" ap=""
-
-    local -a _ap_list=()
-    local _c
-    for _c in "${ALT_SYNC_ASKPASS_BIN:-}" "${SUDO_ASKPASS:-}" zenity yad qarma kdialog xmessage; do
-        [[ -n "$_c" ]] && command -v "$_c" >/dev/null 2>&1 || continue
-        local _dup=0 _d
-        for _d in "${_ap_list[@]}"; do [[ "$_d" == "$_c" ]] && _dup=1 && break; done
-        (( _dup )) || _ap_list+=("$_c")
-    done
-    local _rc=0 _out="" _errf="/dev/null" _try=0
-    _errf="/tmp/alt-sync-askpass.$$.err"
-    : > "$_errf" 2>/dev/null || _errf="/dev/null"
-    for ap in "${_ap_list[@]}"; do
-        _try=$((_try + 1))
-        _out=""
-        case "$ap" in
-            zenity|yad)
-                _out=$("$ap" --title "Alt Sync — подтверждение прав" --password \
-                      --prompt "$prompt" --entry-hidden --width=430 2>"$_errf"); _rc=$? ;;
-            qarma)
-                _out=$("$ap" --title "Alt Sync — подтверждение прав" --password \
-                      --prompt "$prompt" 2>"$_errf"); _rc=$? ;;
-            kdialog)
-                _out=$(kdialog --title "Alt Sync — подтверждение прав" \
-                      --password "$prompt" 2>"$_errf"); _rc=$? ;;
-            xmessage)
-                local _pw=""
-                xmessage -center -buttons "Отмена:0,Я скопировал(а) пароль в буфер:1" -timeout 90 \
-                    "$prompt"$'\n'"1) Откройте любой редактор/терминал, наберите пароль и скопируйте его (Ctrl+C)."$'\n'"2) Нажмите «Я скопировал(а) пароль в буфер»." 2>/dev/null || { _rc=1; _out=""; }
-                if (( _rc == 0 )); then
-                    if command -v xclip >/dev/null 2>&1; then
-                        _pw=$(xclip -selection clipboard -o 2>/dev/null | head -1)
-                    elif command -v xsel >/dev/null 2>&1; then
-                        _pw=$(xsel -b 2>/dev/null | head -1)
-                    fi
-                    _out="$_pw"; unset _pw
-                fi ;;
-            *)
-                _out=$("$ap" "$prompt" 2>"$_errf"); _rc=$? ;;
-        esac
-        if (( _rc == 0 )) && [[ -n "$_out" ]]; then
-            [[ -f "$_errf" ]] && rm -f "$_errf" 2>/dev/null
-            printf '%s' "$_out"
-            return 0
-        fi
-        if [[ "$_errf" != "/dev/null" && -s "$_errf" ]]; then
-            local _emsg
-            _emsg=$(head -3 "$_errf" | tr '\n' ' ')
-            if declare -F log >/dev/null 2>&1; then
-                log "askpass: $ap (rc=$_rc): $_emsg" 2>/dev/null || true
-            fi
-            printf 'askpass: %s (rc=%s): %s\n' "$ap" "$_rc" "$_emsg" >> "${ALT_SYNC_ASKPASS_ERRLOG:-/tmp/alt-sync-askpass.log}" 2>/dev/null || true
-        elif (( _rc != 0 )); then
-            if declare -F log >/dev/null 2>&1; then
-                log "askpass: виджет $ap вернул rc=$_rc без вывода — окно могло не появиться; пробую следующий" 2>/dev/null || true
-            fi
-            printf 'askpass: виджет %s вернул rc=%s без вывода — пробую следующий\n' "$ap" "$_rc" >> "${ALT_SYNC_ASKPASS_ERRLOG:-/tmp/alt-sync-askpass.log}" 2>/dev/null || true
-        fi
-        [[ -f "$_errf" ]] && rm -f "$_errf" 2>/dev/null
-    done
-    return 1
-}
-
-sudo_pipe_as_root() {
-    local _pw _arc _src _cmd="$*"
-    if [[ "$(id -u)" == "0" ]]; then
-        bash -c "$_cmd"
-        return $?
-    fi
-    _pw=$(askpass_get_password "Для продолжения нужен пароль администратора (root):")
-    _arc=$?
-    if (( _arc != 0 )) || [[ -z "$_pw" ]]; then
-        if [[ "$(id -u)" == "0" ]]; then
-            bash -c "$_cmd"
-            return $?
-        fi
-        unset _pw _arc
-        return 10
-    fi
-	
-    local -a _sk=(--preserve-env=ALT_SYNC_GUI --preserve-env=ALT_SYNC_ELEVATED \
-                  --preserve-env=ALT_SYNC_ORIG_UID --preserve-env=ALT_SYNC_NO_ESCALATE \
-                  --preserve-env=ALT_SYNC_ARGS_B64 --preserve-env=ALT_SYNC_ARGS_FILE \
-                  --preserve-env=ALT_SYNC_READY_FILE \
-                  --preserve-env=ALT_SYNC_SCRIPT_DIR --preserve-env=ALT_SYNC_NONINTERACTIVE \
-                  --preserve-env=ALT_SYNC_TARGET_USER --preserve-env=ALT_SYNC_ALLOW_NET \
-                  --preserve-env=ALT_SYNC_LOG_FILE --preserve-env=ALT_SYNC_CANCEL_FLAG --preserve-env=ALT_SYNC_BACKUP_NETWORK_KEYS \
-                  --preserve-env=ALT_SYNC_BACKUP_MOZILLA --preserve-env=ALT_SYNC_CRLF_FIXED \
-                  --preserve-env=ALT_SYNC_ASSUME_YES --preserve-env=ALT_SYNC_NO_AUTOINSTALL \
-                  --preserve-env=ALT_SYNC_ASKPASS_BIN --preserve-env=ALT_SYNC_ORIG_USER \
-                  --preserve-env=ALT_SYNC_BACKUP_DIR --preserve-env=ALT_SYNC_DEPS_CACHE_DIR \
-                  --preserve-env=ALT_SYNC_APT_INTERACTIVE \
-                  --preserve-env=SUDO_USER --preserve-env=SUDO_UID --preserve-env=SUDO_GID)
-    if ! sudo -h 2>/dev/null | grep -q -- '--preserve-env'; then
-        _sk=()
-    fi
-    printf '%s\n' "$_pw" | sudo -S -p '' "${_sk[@]}" bash -c "$_cmd"
-    _src=$?
-    unset _pw _arc
-    if (( _src == 1 )); then
-        if ! sudo -n true 2>/dev/null; then
-            return 11
-        fi
-    fi
-    return $_src
-}
+SCRIPT_VERSION="2.0.0-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -227,280 +32,42 @@ if [[ "$SCRIPT_DIR" == *[[:space:]]* || "$SELF" == *[[:space:]]* ]]; then
     exit 1
 fi
 
-if [[ $EUID -eq 0 ]]; then
-    _early_recovered=0
-    if (($# > 0)); then
-        _ea_keep=()
-        for _ea in "$@"; do
-            case "$_ea" in
-                export|export-offline|import|import-offline|cryptopro|verify|fetch-deps|\
-                -y|--yes|--defaults|-h|--help|--version|-V|\
-                --with-network-keys|--without-network-keys|--with-mozilla|--without-mozilla|\
-                --user|--backup-dir|--user=*|--backup-dir=*)
-                    _ea_keep+=("$_ea") ;;
-                *[!A-Za-z0-9+/=]*)
-                    _ea_keep+=("$_ea") ;;
-                *)
-                    if [[ "${#_ea}" -lt 8 ]]; then
-                        _ea_keep+=("$_ea")
-                        continue
-                    fi
-                    _ed="$(printf '%s' "$_ea" | base64 -d 2>/dev/null)" || _ed=""
-                    if [[ -z "$_ed" ]]; then
-                        _et="${_ea:0:$(( ${#_ea} - ${#_ea} % 4 ))}"
-                        _ed="$(printf '%s' "$_et" | base64 -d 2>/dev/null)" || _ed=""
-                    fi
-                    if [[ -n "$_ed" ]] && printf '%s\n' "$_ed" | grep -aqE \
-                        -e '^(export|import|cryptopro|verify|fetch-deps)' \
-                        -e '^--[a-z]' ; then
-                        if printf '%s' "$_ed" | LC_ALL=C grep -qa '[^[:print:][:space:]]'; then
-                            printf '%s WARN: Мусорный аргумент «%s» (битый осколок env-релея) выброшен на раннем этапе.\n' "$(date '+%F %T')" "$_ea" >&2
-                        else
-                        while IFS= read -r _el; do
-                            [[ -z "$_el" || "$_el" == "-" ]] && continue
-                            _ea_keep+=("$_el"); _early_recovered=1
-                        done <<<"$_ed"
-                        fi
-                    else
-                        printf '%s WARN: Мусорный аргумент «%s» (осколок env-релея) выброшен на раннем этапе.\n' "$(date '+%F %T')" "$_ea" >&2
-                    fi
-                    unset _ed _et ;;
-            esac
-        done
-        set -- ${_ea_keep[@]+"${_ea_keep[@]}"}
-        unset _ea _ea_keep
-    fi
-    if [[ "${ALT_SYNC_GUI:-0}" != "1" ]]; then
-        ALT_SYNC_GUI=1; export ALT_SYNC_GUI
-    fi
-    ALT_SYNC_NO_ESCALATE=1; export ALT_SYNC_NO_ESCALATE
-    ALT_SYNC_ELEVATED=1; export ALT_SYNC_ELEVATED
-    if [[ $# -eq 0 ]]; then
-        _la=""; _lt=""; _lc=""
-        for _lf in "/run/alt-sync/gui.last.log" "/tmp/alt-sync-gui.last.log" \
-                   "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
-            [[ -f "$_lf" ]] || continue
-            _lc=$(tail -20 "$_lf" 2>/dev/null \
-                  | grep -a ' задача cli=' | tail -1 \
-                  | sed -nE 's/.*cli=([^ ]+) .*/\1/p')
-            _la=$(tail -20 "$_lf" 2>/dev/null \
-                  | grep -a ' задача cli=' | tail -1 \
-                  | sed -nE 's/.*cli=[^ ]+ [^ ]*=(.*) пользователь=.*/\1/p')
-            [[ -n "$_la" ]] && break
-        done
-        if [[ -n "$_la" ]]; then
-            set -- $_la
-            case "${1:-}" in
-                export|export-offline|import|import-offline|cryptopro|verify|fetch-deps) : ;;
-                *)  case "$_lc" in
-                        export|export-offline|import|import-offline|cryptopro|verify|fetch-deps)
-                            set -- "$_lc" "$@" ;;
-                    esac ;;
-            esac
-            printf '%s INFO: Действие восстановлено из следа GUI (точная CLI-строка): %s\n' "$(date '+%F %T')" "$*" >&2
+if [[ $EUID -ne 0 ]]; then
+    if [[ "${ALT_SYNC_ALLOW_ROOT_RESTART:-1}" == "1" && "${ALT_SYNC_NO_ESCALATE:-0}" != "1" ]]; then
+        _as_env=(DEBIAN_FRONTEND=noninteractive "ALT_SYNC_SCRIPT_DIR=$SCRIPT_DIR")
+        [[ -n "${ALT_SYNC_NONINTERACTIVE:-}" ]] && _as_env+=("ALT_SYNC_NONINTERACTIVE=$ALT_SYNC_NONINTERACTIVE")
+        [[ -n "${ALT_SYNC_ASSUME_YES:-}"   ]] && _as_env+=("ALT_SYNC_ASSUME_YES=$ALT_SYNC_ASSUME_YES")
+        [[ -n "${ALT_SYNC_TARGET_USER:-}"  ]] && _as_env+=("ALT_SYNC_TARGET_USER=$ALT_SYNC_TARGET_USER")
+        [[ -n "${ALT_SYNC_BACKUP_DIR:-}"   ]] && _as_env+=("ALT_SYNC_BACKUP_DIR=$ALT_SYNC_BACKUP_DIR")
+        [[ -n "${ALT_SYNC_BACKUP_NETWORK_KEYS:-}" ]] && _as_env+=("ALT_SYNC_BACKUP_NETWORK_KEYS=$ALT_SYNC_BACKUP_NETWORK_KEYS")
+        [[ -n "${ALT_SYNC_BACKUP_MOZILLA:-}" ]] && _as_env+=("ALT_SYNC_BACKUP_MOZILLA=$ALT_SYNC_BACKUP_MOZILLA")
+        [[ -n "${ALT_SYNC_ALLOW_NET:-}"    ]] && _as_env+=("ALT_SYNC_ALLOW_NET=$ALT_SYNC_ALLOW_NET")
+        [[ -n "${ALT_SYNC_NO_AUTOINSTALL:-}" ]] && _as_env+=("ALT_SYNC_NO_AUTOINSTALL=$ALT_SYNC_NO_AUTOINSTALL")
+        _self_q="$(printf '%q' "$SELF")"
+        _args_q=""
+        for _a in "$@"; do _args_q+=" $(printf '%q' "$_a")"; done
+        unset _a
+        if command -v sudo >/dev/null 2>&1; then
+            printf 'Для работы нужны права root — перезапускаюсь через sudo (введите пароль при запросе)...\n' >&2
+            exec sudo "${_as_env[@]}" bash "$SELF" "$@"
+        elif command -v pkexec >/dev/null 2>&1; then
+            printf 'Для работы нужны права root — перезапускаюсь через pkexec...\n' >&2
+            exec pkexec env "${_as_env[@]}" bash "$SELF" "$@"
+        elif command -v su >/dev/null 2>&1; then
+            printf 'Для работы нужны права root — перезапускаюсь через su (введите пароль root)...\n' >&2
+            exec su -c "env ${_as_env[*]} bash $_self_q${_args_q}" root
         else
-        _tt="$(gui_task_trace_read)" || _tt=""
-        if [[ -n "${_tt// /}" ]]; then
-            set -- $_tt
-            printf '%s INFO: Действие восстановлено из следа задачи: %s\n' "$(date '+%F %T')" "$*" >&2
-        else
-        for _lf in "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
-            [[ -f "$_lf" ]] || continue
-            _la=$(tail -5 "$_lf" 2>/dev/null \
-                  | grep -a 'форма rc=0' | tail -1 \
-                  | sed -nE 's/.*вывод="([^"|]*)\|.*/\1/p')
-            [[ -n "$_la" ]] && break
-        done
-        for _lf in "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
-            [[ -f "$_lf" ]] || continue
-            _lt=$(tail -5 "$_lf" 2>/dev/null \
-                  | grep -a 'форма rc=0' | tail -1 \
-                  | sed -nE 's/.*вывод="[^|]*\|([^|]*)\|.*/\1/p')
-            [[ -n "$_lt" ]] && break
-        done
-        case "$_la" in
-            *локальн*|*без\ сети*) set -- export-offline --yes ;;
-            *Экспорт\ эталона*)    set -- export --yes ;;
-            *Импорт*клон*|*Импорт*)
-                if [[ "$_la" == *офлайн* ]]; then set -- import-offline --yes
-                else set -- import --defaults; fi ;;
-            *CryptoPro*|*cryptopro*) set -- cryptopro --yes ;;
-            *Проверка*бэкапа*|*verify*) set -- verify --yes ;;
-            *Зависимост*|*fetch*)  set -- fetch-deps --yes ;;
-            *)
-                case "$_lt" in
-                    WIFI)   set -- export-offline --yes ;;
-                    IMPORT*) [[ "$_la" == *офлайн* ]] && set -- import-offline --yes || set -- import --defaults ;;
-                    *)      set -- export --yes ;;
-                esac
-                ;;
-        esac
-        [[ $# -gt 0 ]] && printf '%s INFO: Действие восстановлено из следа последнего запуска GUI (%s): %s\n' "$(date '+%F %T')" "$_la" "$*" >&2
-        fi
-        fi
-        unset _la _lt _lf _lf2 _tt
-    fi
-    printf 'Работаем от root (повышение выполнено GUI-оболочкой) — повторный запрос пароля не требуется.\n' >&2
-elif [[ $EUID -ne 0 ]]; then
-    _AS_NONINTERACTIVE="${ALT_SYNC_NONINTERACTIVE:-0}"
-    _AS_ASSUME_YES="${ALT_SYNC_ASSUME_YES:-0}"
-    _AS_TARGET_USER="${ALT_SYNC_TARGET_USER:-}"
-    _AS_NET_KEYS="${ALT_SYNC_BACKUP_NETWORK_KEYS:-0}"
-    _AS_MOZILLA="${ALT_SYNC_BACKUP_MOZILLA:-0}"
-    _AS_GUI="${ALT_SYNC_GUI:-0}"
-    _AS_ALLOW_NET="${ALT_SYNC_ALLOW_NET:-0}"
-    _AS_NO_AUTOINSTALL="${ALT_SYNC_NO_AUTOINSTALL:-0}"
-    _AS_BACKUP_DIR="${ALT_SYNC_BACKUP_DIR:-}"
-
-    if [[ "${ALT_SYNC_ELEVATED:-}" == "1" ]] && [[ "$(id -u)" != "0" ]]; then
-        printf 'Предупреждение: ALT_SYNC_ELEVATED=1 без root-прав — работаю как обычный пользователь (без повторного запроса пароля).\n' >&2
-        _et="$(gui_task_trace_read)" || _et=""
-        if [[ -n "${_et// /}" ]]; then
-            set -- $_et
-            printf '%s INFO: Действие восстановлено из следа задачи (не-root): %s\n' "$(date '+%F %T')" "$*" >&2
-        fi
-        unset _et
-    elif [[ "${ALT_SYNC_NO_ESCALATE:-}" == "1" && "${ALT_SYNC_GUI:-0}" == "1" ]] && [[ "$(id -u)" != "0" ]]; then
-        # Эскалация уже была выполнена GUI-оболочкой ровно один раз. Повторный
-        # запрос пароля здесь запрещён: если прав не хватает — завершаемся с
-        # явной ошибкой, а не открываем второе окно ввода пароля и не уходим в
-        # невидимое интерактивное меню.
-        printf 'ERROR: Задача требует прав root, но эскалация отключена (ALT_SYNC_NO_ESCALATE=1) и текущий uid=%s.\n' "$(id -u)" >&2
-        printf 'Повторный запрос пароля не выполняется. Запустите вручную: sudo bash %s <действие> [флаги]\n' "${BASH_SOURCE[0]}" >&2
-        exit 78
-    elif [[ "${ALT_SYNC_ELEVATED:-}" == "1" && -z "${SUDO_USER:-}" ]]; then
-        if [[ "$(id -u)" == "0" ]]; then
-            printf 'Предупреждение: SUDO_USER пуст при ALT_SYNC_ELEVATED=1, но эффективный uid=root (0) — продолжаем работу.\n' >&2
-        elif [[ -n "${ALT_SYNC_NO_ESCALATE:-}" ]]; then
-            printf 'Эскалация прав отключена (ALT_SYNC_NO_ESCALATE) — работаю с текущими правами без повторного ввода пароля.\n' >&2
-        else
-            printf 'Повышение прав не удалось (sudo/pkexec не вернули root-окружение).\nЗапустите вручную от имени root: sudo bash %s\n' "$SELF" >&2
+            printf 'ОШИБКА: требуются права root, но ни sudo, ни pkexec, ни su не найдены.\n' >&2
+            printf 'Запустите вручную: su -c "bash %s %s"\n' "$SELF" "$*" >&2
             exit 1
         fi
-    fi
-    _as_env=()
-    _as_env+=(DEBIAN_FRONTEND=noninteractive ALT_SYNC_ELEVATED=1 \
-             "ALT_SYNC_ORIG_UID=$(id -u)")
-    [[ -n "${ALT_SYNC_NO_ESCALATE:-}" ]] && _as_env+=("ALT_SYNC_NO_ESCALATE=$ALT_SYNC_NO_ESCALATE")
-    [[ -n "${ALT_SYNC_CRLF_FIXED:-}" ]] && _as_env+=("ALT_SYNC_CRLF_FIXED=$ALT_SYNC_CRLF_FIXED")
-    _as_env+=("ALT_SYNC_SCRIPT_DIR=$SCRIPT_DIR"
-             "ALT_SYNC_NONINTERACTIVE=$_AS_NONINTERACTIVE"
-             "ALT_SYNC_ASSUME_YES=$_AS_ASSUME_YES")
-    [[ -n "$_AS_TARGET_USER"  ]] && _as_env+=("ALT_SYNC_TARGET_USER=$_AS_TARGET_USER")
-    _as_env+=("ALT_SYNC_BACKUP_NETWORK_KEYS=$_AS_NET_KEYS"
-             "ALT_SYNC_BACKUP_MOZILLA=$_AS_MOZILLA"
-             "ALT_SYNC_GUI=$_AS_GUI"
-             "ALT_SYNC_ALLOW_NET=$_AS_ALLOW_NET"
-             "ALT_SYNC_NO_AUTOINSTALL=$_AS_NO_AUTOINSTALL")
-    [[ -n "$_AS_BACKUP_DIR" ]] && _as_env+=("ALT_SYNC_BACKUP_DIR=$_AS_BACKUP_DIR")
-    [[ -n "${ALT_SYNC_ARGS_B64:-}" ]] && _as_env+=("ALT_SYNC_ARGS_B64=$ALT_SYNC_ARGS_B64")
-    [[ -n "${ALT_SYNC_ARGS_FILE:-}" ]] && _as_env+=("ALT_SYNC_ARGS_FILE=$ALT_SYNC_ARGS_FILE")
-    [[ -n "${ALT_SYNC_LOG_FILE:-}" ]] && _as_env+=("ALT_SYNC_LOG_FILE=$ALT_SYNC_LOG_FILE")
-    [[ -n "${ALT_SYNC_CANCEL_FLAG:-}" ]] && _as_env+=("ALT_SYNC_CANCEL_FLAG=$ALT_SYNC_CANCEL_FLAG")
-    [[ -n "${ALT_SYNC_READY_FILE:-}" ]] && _as_env+=("ALT_SYNC_READY_FILE=$ALT_SYNC_READY_FILE")
-    [[ -n "${ALT_SYNC_LOG_FILE:-}" ]] && _as_env+=("--log-file" "$ALT_SYNC_LOG_FILE")
-    [[ -n "${ALT_SYNC_CANCEL_FLAG:-}" ]] && _as_env+=("--cancel-flag" "$ALT_SYNC_CANCEL_FLAG")
-    unset _lfclean _lfskip _lfa
-
-    for _v in "$SELF" "${_as_env[@]}" "$@"; do
-        if [[ "$_v" == *"'"* ]]; then
-            printf 'Некорректный символ (одинарная кавычка) в пути/параметрах запуска: %s\n' "$_v" >&2
-            exit 1
-        fi
-    done
-    unset _v
-
-    ORIG_LOGIN="$(id -un 2>/dev/null || true)"
-    if [[ -n "$ORIG_LOGIN" && "$ORIG_LOGIN" != "root" ]]; then
-        _as_env+=("ALT_SYNC_ORIG_USER=$ORIG_LOGIN")
-    fi
-    unset ORIG_LOGIN
-
-    if command -v sudo >/dev/null 2>&1; then
-        _gui_ask=0
-        [[ "${ALT_SYNC_GUI:-0}" == "1" ]] && _gui_ask=1
-        if (( _gui_ask )); then
-            _cmd="env"
-            for _e in "${_as_env[@]}"; do _cmd+=" $(printf '%q' "$_e")"; done
-            [[ -n "$(id -un 2>/dev/null || true)" && "$(id -un)" != "root" ]] \
-                && _cmd+=" $(printf '%q' "SUDO_USER=$(id -un)")"
-            [[ "$(id -u)" != "0" ]] && _cmd+=" $(printf '%q' "SUDO_UID=$(id -u)") $(printf '%q' "SUDO_GID=$(id -g)")"
-            _cmd+=" bash $(printf '%q' "$SELF")"
-            for _a in "$@"; do _cmd+=" $(printf '%q' "$_a")"; done
-            _gready="${ALT_SYNC_READY_FILE:-${TMPDIR:-/tmp}/alt_sync_ready.$$.tmp}"
-            _cmd+=" $(printf '%q' "ALT_SYNC_READY_FILE=$_gready")"
-            sudo_pipe_as_root "$_cmd"
-            _sr=$?
-            [[ -n "${ALT_SYNC_READY_FILE:-}" ]] || rm -f "$_gready" 2>/dev/null || true
-            case $_sr in
-                0) ;;
-                10) printf 'Ввод пароля отменён (диалог закрыт или поле осталось пустым).\n' >&2; exit 1 ;;
-                11) printf 'Пароль администратора не принят (или нет прав sudo).\n' >&2; exit 1 ;;
-                *)  exit $_sr ;;
-            esac
-            exit 0
-        fi
-        printf 'Запрашиваю права root через sudo... (введите пароль при запросе)\n' >&2
-        exec sudo "${_as_env[@]}" bash "$SELF" "$@"
-    elif command -v pkexec >/dev/null 2>&1; then
-        printf 'Запрашиваю права root через pkexec...\n' >&2
-        exec pkexec env DISPLAY="${DISPLAY:-:0}" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
-             "${_as_env[@]}" bash "$SELF" "$@"
-    elif command -v su >/dev/null 2>&1; then
-        printf 'Запрашиваю права root через su...\n' >&2
-        _sucmd="env"
-        for _e in "${_as_env[@]}"; do _sucmd+=" $(printf '%q' "$_e")"; done
-        _sucmd+=" bash $(printf '%q' "$SELF")"
-        for _a in "$@"; do _sucmd+=" $(printf '%q' "$_a")"; done
-        exec su -c "$_sucmd" root
+    elif [[ "${ALT_SYNC_NO_ESCALATE:-0}" == "1" ]]; then
+        printf 'WARN: ALT_SYNC_NO_ESCALATE=1 — работаю без повышения прав с uid=%s.\n' "$(id -u)" >&2
     else
-        printf 'Нужен root. Запустите: su -c "bash %s"\n' "$SELF" >&2
-        exit 1
+        printf 'ОШИБКА: повышение прав отключено (ALT_SYNC_ALLOW_ROOT_RESTART=0), а скрипту нужен root (uid=%s).\n' "$(id -u)" >&2
+        printf 'Запустите вручную: sudo bash %s <действие> [флаги]\n' "$SELF" >&2
+        exit 78
     fi
-fi
-
-if (($# > 0)); then
-    for _hubd in "${AS_HUB_DIRS[@]}" "$SCRIPT_DIR/.alt-sync-hub"; do
-        mkdir -p "$_hubd" 2>/dev/null || continue
-        printf '%s\n' "$@" >"$_hubd/args.txt" 2>/dev/null && chmod a+rw "$_hubd/args.txt" 2>/dev/null || true
-        [[ -f "$_hubd/args.txt" ]] && printf '%s %s\n' "$(date +%s)" "$(id -u)" >"$_hubd/args.stamp" 2>/dev/null && chmod a+rw "$_hubd/args.stamp" 2>/dev/null || true
-    done
-fi
-
-_alt_sync_hub_fresh() {
-    local _st="${1%/*}/args.stamp" _now _age _t _u
-    if [[ -r "$_st" ]]; then
-        read -r _t _u <"$_st" || { _t=""; _u=""; }
-        if [[ "$_t" =~ ^[0-9]+$ ]]; then
-            _now=$(date +%s); _age=$((_now - _t))
-            (( _age >= 0 && _age < 300 )) && return 0
-            return 1
-        fi
-    fi
-    [[ -f "$1" ]] || return 1
-    _t=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "")
-    [[ "$_t" =~ ^[0-9]+$ ]] || return 1
-    _now=$(date +%s); _age=$((_now - _t))
-    (( _age >= 0 && _age < 300 ))
-}
-if [[ $# -eq 0 ]]; then
-    for _hubf in "${AS_HUB_DIRS[0]}/args.txt" "/run/alt-sync/args.txt" \
-                 "$SCRIPT_DIR/.alt-sync-hub/args.txt" "${TMPDIR:-/tmp}/alt-sync-hub.$(id -u)/args.txt"; do
-        [[ -n "$_hubf" && -r "$_hubf" ]] || continue
-        _alt_sync_hub_fresh "$_hubf" || { printf '%s INFO: Хаб-канал %s устарел (>5 мин) — пропускаю.\n' "$(date '+%F %T')" "$_hubf" >&2; continue; }
-        _hub_args=()
-        while IFS= read -r _hl; do
-            [[ -z "$_hl" ]] && continue
-            _hub_args+=("$_hl")
-        done <"$_hubf"
-        if ((${#_hub_args[@]} > 0)); then
-            set -- "${_hub_args[@]}"
-            printf '%s INFO: Задача восстановлена из хаба (%s): %s\n' "$(date '+%F %T')" "$_hubf" "$*" >&2
-            break
-        fi
-        unset _hub_args
-    done
-    unset _hubf _hl
 fi
 
 NONINTERACTIVE="${ALT_SYNC_NONINTERACTIVE:-0}"
@@ -522,190 +89,6 @@ for _pre_arg in "$@"; do
     esac
 done
 unset _pre_arg
-
-if (($# > 0)); then
-    _cn_in=("$@"); _cn_out=(); _cn_changed=0
-    for _cn_a in "${_cn_in[@]}"; do
-        if [[ "$_cn_a" =~ ^[A-Za-z0-9+/=]{8,}$ ]]; then
-            _cn_dec="$(printf '%s' "$_cn_a" | base64 -d 2>/dev/null)" || { _cn_out+=("$_cn_a"); continue; }
-            if [[ "$(printf '%s' "$_cn_dec" | base64 | tr -d '\n')" == "$_cn_a" ]]; then
-                while IFS= read -r _cn_line; do
-                    [[ -z "$_cn_line" ]] && continue
-                    _cn_out+=("$_cn_line")
-                done <<<"$_cn_dec"
-                _cn_changed=1
-                continue
-            fi
-        fi
-        _cn_out+=("$_cn_a")
-    done
-    if (( _cn_changed )) && ((${#_cn_out[@]} > 0)); then
-        set -- "${_cn_out[@]}"
-        printf '%s INFO: Аргументы задачи восстановлены из base64-формата (защита от двойной передачи cmdline+env).\n' "$(date '+%F %T')" >&2
-    fi
-    unset _cn_in _cn_out _cn_a _cn_dec _cn_line _cn_changed
-fi
-
-alt_sync_read_args_channel() {
-    local f="${ALT_SYNC_ARGS_FILE:-}"
-    [[ -n "$f" && -r "$f" ]] || return 0
-    cat -- "$f" 2>/dev/null || true
-}
-
-alt_sync_merge_args() {
-    local -a src=("$@") _l
-    while IFS= read -r _l; do
-        [[ -z "$_l" ]] && continue
-        src+=("$_l")
-    done < <(alt_sync_read_args_channel; \
-             if [[ -n "${ALT_SYNC_ARGS_B64:-}" ]]; then
-                 printf '%s\n' "$ALT_SYNC_ARGS_B64" | sed 's/.\{76\}/&\n/g' \
-                   | while IFS= read -r _b; do [[ -z "$_b" ]] && continue
-                       printf '%s\n' "$_b" | base64 -d 2>/dev/null | awk 'NR==1'; done
-             fi)
-    local -a flat=()
-    for _l in "${src[@]}"; do
-        case "$_l" in
-            "--user "*)      flat+=("--user" "${_l#--user }") ;;
-            "--backup-dir "*) flat+=("--backup-dir" "${_l#--backup-dir }") ;;
-            *)               flat+=("$_l") ;;
-        esac
-    done
-    local -a out=(); local seen="|" x
-    for x in "${flat[@]}"; do
-        [[ "$seen" == *"|$x|"* ]] && continue
-        out+=("$x"); seen+="|${x}|"
-    done
-    ((${#out[@]})) && printf '%s\n' "${out[@]}"
-}
-
-_alt_sync_action_seen=""
-while IFS= read -r _aa; do
-    case "$_aa" in
-        export|export-offline|import|import-offline|cryptopro|verify|fetch-deps)
-            _alt_sync_action_seen="$_aa" ;;
-    esac
-done < <(alt_sync_merge_args "$@" 2>/dev/null || true)
-if [[ -n "${ALT_SYNC_ARGS_FILE:-}" && ! -s "${ALT_SYNC_ARGS_FILE:-/nonexistent}" \
-    && -n "$_alt_sync_action_seen" ]]; then
-    printf '%s\n' "$_alt_sync_action_seen" >"$ALT_SYNC_ARGS_FILE" 2>/dev/null || true
-fi
-unset _alt_sync_action_seen _aa
-
-if [[ -n "${ALT_SYNC_ARGS_FILE:-}${ALT_SYNC_ARGS_B64:-}" \
-    && ( "${ALT_SYNC_GUI:-0}" == "1" || "${ALT_SYNC_NONINTERACTIVE:-0}" == "1" ) ]]; then
-    _relay_args=()
-    while IFS= read -r _ra; do
-        [[ -z "$_ra" ]] && continue
-        _relay_args+=("$_ra")
-    done < <(alt_sync_merge_args "$@")
-    ((${#_relay_args[@]} > 0)) && set -- "${_relay_args[@]}"
-    unset _relay_args _ra _b64line ALT_SYNC_ARGS_B64
-fi
-
-if [[ $EUID -eq 0 ]]; then
-    if [[ $# -eq 0 && -n "${ALT_SYNC_ARGS_FILE:-}" && -r "${ALT_SYNC_ARGS_FILE:-/nonexistent}" ]] \
-        && [[ "${ALT_SYNC_GUI:-0}" == "1" || "${ALT_SYNC_NONINTERACTIVE:-0}" == "1" ]]; then
-        _fc_args=()
-        while IFS= read -r _fc_l; do
-            [[ -z "$_fc_l" ]] && continue
-            _fc_args+=("$_fc_l")
-        done <"$ALT_SYNC_ARGS_FILE"
-        if ((${#_fc_args[@]} > 0)); then
-            set -- "${_fc_args[@]}"
-            printf '%s INFO: Действие восстановлено из файла-канала задачи (%s).\n' "$(date '+%F %T')" "$1" >&2
-        fi
-        unset _fc_args _fc_l
-    fi
-    for _a in "$@"; do
-        case "$_a" in
-            export|export-offline|import|import-offline|cryptopro|verify|fetch-deps)
-                if [[ "${ALT_SYNC_GUI:-0}" != "1" ]]; then
-                    ALT_SYNC_GUI=1; export ALT_SYNC_GUI
-                    printf '%s INFO: Режим GUI восстановлен из аргументов задачи (%s).\n' "$(date '+%F %T')" "$_a" >&2
-                fi
-                break ;;
-        esac
-    done
-    unset _a
-    if [[ $# -eq 0 ]]; then
-        _la=""; _lt=""; _lc=""
-        for _lf in "/run/alt-sync/gui.last.log" "/tmp/alt-sync-gui.last.log" \
-                   "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
-            [[ -f "$_lf" ]] || continue
-            _lc=$(tail -20 "$_lf" 2>/dev/null \
-                  | grep -a ' задача cli=' | tail -1 \
-                  | sed -nE 's/.*cli=([^ ]+) .*/\1/p')
-            _la=$(tail -20 "$_lf" 2>/dev/null \
-                  | grep -a ' задача cli=' | tail -1 \
-                  | sed -nE 's/.*cli=[^ ]+ [^ ]*=(.*) пользователь=.*/\1/p')
-            [[ -n "$_la" ]] && break
-        done
-        if [[ -n "$_la" ]]; then
-            set -- $_la
-            case "${1:-}" in
-                export|export-offline|import|import-offline|cryptopro|verify|fetch-deps) : ;;
-                *)  case "$_lc" in
-                        export|export-offline|import|import-offline|cryptopro|verify|fetch-deps)
-                            set -- "$_lc" "$@" ;;
-                    esac ;;
-            esac
-            printf '%s INFO: Действие восстановлено из следа GUI (точная CLI-строка): %s\n' "$(date '+%F %T')" "$*" >&2
-        else
-        _tt="$(gui_task_trace_read)" || _tt=""
-        if [[ -n "${_tt// /}" ]]; then
-            set -- $_tt
-            printf '%s INFO: Действие восстановлено из следа задачи: %s\n' "$(date '+%F %T')" "$*" >&2
-        else
-        for _lf in "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
-            [[ -f "$_lf" ]] || continue
-            _la=$(tail -5 "$_lf" 2>/dev/null \
-                  | grep -a 'форма rc=0' | tail -1 \
-                  | sed -nE 's/.*вывод="([^"|]*)\|.*/\1/p')
-            [[ -n "$_la" ]] && break
-        done
-        for _lf in "$SCRIPT_DIR/alt_sync_gui.last.log" "$SCRIPT_DIR/logs/alt_sync_gui.last.log"; do
-            [[ -f "$_lf" ]] || continue
-            _lt=$(tail -5 "$_lf" 2>/dev/null \
-                  | grep -a 'форма rc=0' | tail -1 \
-                  | sed -nE 's/.*вывод="[^|]*\|([^|]*)\|.*/\1/p')
-            [[ -n "$_lt" ]] && break
-        done
-        case "$_la" in
-            *локальн*|*без\ сети*) set -- export-offline --yes ;;
-            *Экспорт\ эталона*)    set -- export --yes ;;
-            *Импорт*)
-                if [[ "$_la" == *офлайн* ]]; then set -- import-offline --yes
-                else set -- import --defaults; fi ;;
-            *CryptoPro*|*cryptopro*) set -- cryptopro --yes ;;
-            *Проверка*|*целостность*|*verify*) set -- verify --yes ;;
-            *компонент*|*Зависимост*|*fetch*)  set -- fetch-deps --yes ;;
-            *)
-                case "$_lt" in
-                    WIFI)   set -- export-offline --yes ;;
-                    *)      set -- export --yes ;;
-                esac ;;
-        esac
-        [[ $# -gt 0 ]] && printf '%s INFO: Действие восстановлено из следа GUI (метка: %s): %s\n' "$(date '+%F %T')" "$_la" "$*" >&2
-        fi
-        fi
-        unset _la _lt _lf _tt
-    fi
-    [[ "${ALT_SYNC_NONINTERACTIVE:-0}" == "1" ]] || {
-        for _f in "$@"; do
-            case "$_f" in -y|--yes|--defaults)
-                ALT_SYNC_NONINTERACTIVE=1; export ALT_SYNC_NONINTERACTIVE
-                break ;;
-            esac
-        done
-        unset _f
-    }
-    if [[ "${ALT_SYNC_GUI:-0}" == "1" ]]; then
-        [[ "${ALT_SYNC_NONINTERACTIVE:-0}" == "1" ]] || {
-            ALT_SYNC_NONINTERACTIVE=1; export ALT_SYNC_NONINTERACTIVE
-        }
-    fi
-fi
 
 if [[ $EUID -eq 0 && -z "${ALT_SYNC_TARGET_USER:-}" ]]; then
     _tu_prev=""
@@ -771,17 +154,6 @@ else
 fi
 
 LOG_FILE="${ALT_SYNC_LOG_FILE:-}"
-if [[ -z "$LOG_FILE" ]]; then
-    for _lpb in "${ALT_SYNC_SCRIPT_DIR:-$SCRIPT_DIR}/.alt_sync_live.path" \
-                "$SCRIPT_DIR/.alt_sync_live.path" "/run/alt-sync/log.path" \
-                "${TMPDIR:-/tmp}/alt-sync-hub.$(id -u)/log.path" \
-                "${TMPDIR:-/tmp}/alt-sync-hub.0/log.path"; do
-        [[ -f "$_lpb" ]] || continue
-        _lpc="$(head -1 "$_lpb" 2>/dev/null)"
-        [[ -n "$_lpc" && -e "$_lpc" ]] && { LOG_FILE="$_lpc"; break; }
-    done
-    unset _lpb _lpc
-fi
 if [[ -n "$LOG_FILE" ]]; then
     case "$LOG_FILE" in
         "$LOG_DIR/"*) : ;;
@@ -805,34 +177,7 @@ if [[ -z "$LOG_FILE" ]]; then
     }
 fi
 REPORT_DIR="$LOG_DIR"
-_as_log_beacons() {
-    local _lp="${ALT_SYNC_LOG_FILE:-$LOG_FILE}" _hubd _bp _own=""
-    [[ -n "$_lp" ]] || return 0
-    if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]]; then
-        _own="$SUDO_UID:$SUDO_GID"
-    elif [[ -n "${GUI_OWNER_UID:-}" ]]; then
-        _own="$GUI_OWNER_UID:${GUI_OWNER_GID:-$GUI_OWNER_UID}"
-    fi
-    if [[ "$EUID" -eq 0 ]]; then
-        if [[ -n "$_own" ]]; then
-            chown "$_own" "$_lp" 2>/dev/null || true
-        else
-            _og=$(stat -c '%u:%g' "/proc/1" 2>/dev/null)
-            [[ -n "${_og:-}" && "$_og" != "0:0" ]] && chown "$_og" "$_lp" 2>/dev/null || true
-        fi
-        chmod a+r "$_lp" 2>/dev/null || true
-    fi
-    if [[ -n "${AS_LOGBEACON:-}" ]]; then
-        printf '%s\n' "$_lp" >"$AS_LOGBEACON" 2>/dev/null || true
-        chmod a+r "$AS_LOGBEACON" 2>/dev/null || true
-    fi
-    for _hubd in "/run/alt-sync" "${TMPDIR:-/tmp}/alt-sync-hub.$(id -u)" "${TMPDIR:-/tmp}/alt-sync-hub.0"; do
-        mkdir -p "$_hubd" 2>/dev/null || continue
-        _bp="$_hubd/log.path"
-        printf '%s\n' "$_lp" >"$_bp" 2>/dev/null && chmod a+rw "$_bp" 2>/dev/null || true
-    done
-    return 0
-}
+_as_log_beacons() { return 0; }
 export ALT_SYNC_LOG_FILE="$LOG_FILE"
 _as_log_beacons
 chmod a+rw "$LOG_FILE" 2>/dev/null || true
@@ -844,23 +189,6 @@ fi
 if ! : >> "$LOG_FILE" 2>/dev/null; then
     printf 'Не удалось создать файл лога: %s\n' "$LOG_FILE" >&2
     exit 1
-fi
-
-GUI_CHOWN_OWNER=""
-if [[ "${ALT_SYNC_GUI:-0}" == "1" && "$EUID" -eq 0 ]]; then
-    if [[ "${SUDO_UID:-}" =~ ^[0-9]+$ ]] && [[ "${SUDO_GID:-}" =~ ^[0-9]+$ ]]; then
-        GUI_CHOWN_OWNER="${SUDO_UID}:${SUDO_GID}"
-    else
-        _gu="${ALT_SYNC_TARGET_USER:-$(detect_default_user 2>/dev/null || true)}"
-        if [[ -n "$_gu" ]] && id "$_gu" >/dev/null 2>&1; then
-            GUI_CHOWN_OWNER="$(id -u "$_gu"):$(id -g "$_gu")"
-        fi
-        unset _gu
-    fi
-    if [[ -n "$GUI_CHOWN_OWNER" ]]; then
-        chown "$GUI_CHOWN_OWNER" "$LOG_DIR" 2>/dev/null || true
-        chmod a+rwx "$LOG_FILE" 2>/dev/null || true
-    fi
 fi
 
 log() {
@@ -902,17 +230,6 @@ _finish_log() {
     wait 2>/dev/null || true
 }
 trap _finish_log EXIT
-
-_alt_sync_signal_ready() {
-    [[ "${ALT_SYNC_GUI:-0}" == "1" ]] || return 0
-    local _rf
-    for _rf in "${ALT_SYNC_READY_FILE:-}" "$AS_READY_FILE" "${TMPDIR:-/tmp}/alt_sync_ready.$$.tmp"; do
-        [[ -n "$_rf" ]] || continue
-        printf '%s\n' "$$" > "$_rf" 2>/dev/null || true
-    done
-}
-_alt_sync_signal_ready
-gui_task_trace_write "$@"
 
 die() {
     printf '%b\n' "${RED}❌ $*${NC}" >&2
@@ -960,18 +277,25 @@ step_start() {
         _spct=$(( (CURRENT_STEP - 1) * 100 / TOTAL_STEPS ))
         (( _spct > 99 )) && _spct=99
     fi
-    local _plist=""
-    [[ -f "$LISTS_DIR/installed_nvra.txt" ]] && _plist="$LISTS_DIR/installed_nvra.txt"
-    log "PROGRESS|step=$CURRENT_STEP|$TOTAL_STEPS|${_plist}|pct=$_spct|$1"
-    ( _as_log_beacons 2>/dev/null; ln -sf "$LOG_FILE" "$LOG_DIR/alt_sync_latest.log" 2>/dev/null ) &
+    printf '%b\n' "  ${CYAN}▓▓▓ Прогресс: ${BOLD}${_spct}%${NC} (шаг ${CURRENT_STEP} из ${TOTAL_STEPS}, время $(elapsed_string))${NC}"
+    log "PROGRESS pct=$_spct step=$CURRENT_STEP/$TOTAL_STEPS :: $1"
 }
 
-gui_cancel_requested() { [[ -n "${ALT_SYNC_CANCEL_FLAG:-}" && -e "$ALT_SYNC_CANCEL_FLAG" ]]; }
-gui_cancel_check() {
-    gui_cancel_requested || return 0
-    log "CANCEL: задача прервана по кнопке «Отмена» (${1:-})"
-    printf '\n%s\n' "⛔ Отменено пользователем (${1:-}). Выполняется откат временных данных…"
+CANCELLED_BY_USER=0
+_on_interrupt() {
     CANCELLED_BY_USER=1
+    printf '
+
+%s
+' "⏹  Получен сигнал прерывания (Ctrl+C). Задача будет корректно остановлена на ближайшей контрольной точке…" >&2
+    log "CANCEL: получен SIGINT/SIGTERM (pid=$$)"
+}
+trap _on_interrupt INT TERM
+
+gui_cancel_check() {
+    (( CANCELLED_BY_USER )) || return 0
+    log "CANCEL: задача прервана пользователем (Ctrl+C) (${1:-})"
+    printf '\n%s\n' "⛔ Отменено пользователем (${1:-}). Выполняется откат временных данных…"
     exit 130
 }
 
@@ -1096,7 +420,7 @@ progress_bar() {
         log "$label $current/$total (${pct}%)"
         local _lbl="$label"
         [[ -n "$item" ]] && _lbl="$label [$item]"
-        log "PROGRESS|detail|$current|$total|pct=$pct|$_lbl"
+        log "PROGRESS detail pct=$pct ($_lbl)"
         LAST_PROGRESS_PCT="$pct"
     fi
 
@@ -1147,9 +471,6 @@ ASSETS_DIR="$BACKUP_DIR/assets"
 MACHINE_ID_FILE="$BACKUP_DIR/.machine_id"
 INSTALL_DIR="${SCRIPT_DIR}/install"
 
-if [[ -n "${GUI_CHOWN_OWNER:-}" && ! -d "$BACKUP_DIR" ]]; then
-    mkdir -p "$BACKUP_DIR" 2>/dev/null && chown "$GUI_CHOWN_OWNER" "$BACKUP_DIR" 2>/dev/null || true
-fi
 
 TARGET_USER=""
 HOME_DIR=""
@@ -1179,11 +500,6 @@ DEPENDENCY_SPECS=(
     "epm|epm"
     "whiptail|dialog"
     "pkexec|polkit"
-    "notify-send|libnotify"
-    "yad|yad"
-    "zenity|zenity"
-    "qarma|qarma"
-    "kdialog|kdialog"
 )
 
 pkg_for_cmd() {
@@ -1213,7 +529,7 @@ for _cmd in rpm apt-get; do
 done
 unset _cmd
 
-OPTIONAL_COMMANDS=(gzip bzip2 xz zstd timeout unrar unar bsdtar 7z 7za unzip epm whiptail systemctl ldconfig udevadm pkexec notify-send yad zenity qarma kdialog)
+OPTIONAL_COMMANDS=(gzip bzip2 xz zstd timeout unrar unar bsdtar 7z 7za unzip epm whiptail systemctl ldconfig udevadm)
 MISSING_OPTIONAL_COMMANDS=()
 for _cmd in "${OPTIONAL_COMMANDS[@]}"; do
     if ! have_cmd "$_cmd"; then
@@ -1222,26 +538,6 @@ for _cmd in "${OPTIONAL_COMMANDS[@]}"; do
 done
 unset _cmd
 
-__widget_missing=0
-for _w in yad zenity qarma kdialog; do
-    [[ " ${MISSING_OPTIONAL_COMMANDS[*]:-} " == *" $_w "* ]] && __widget_missing=$((__widget_missing+1))
-done
-if (( __widget_missing > 0 )) && have_cmd yad; then __widget_missing=0
-elif (( __widget_missing > 0 )) && have_cmd zenity; then __widget_missing=0
-elif (( __widget_missing > 0 )); then __widget_missing=1; fi
-if (( __widget_missing <= 1 )); then
-    __kept=()
-    for _cmd in "${MISSING_OPTIONAL_COMMANDS[@]}"; do
-        case "$_cmd" in yad|zenity|qarma|kdialog) ;; *) __kept+=("$_cmd") ;; esac
-    done
-    if ((${#__kept[@]} < ${#MISSING_OPTIONAL_COMMANDS[@]})); then
-        for _w in yad zenity qarma kdialog; do
-            [[ " ${MISSING_OPTIONAL_COMMANDS[*]:-} " == *" $_w "* ]] && { __kept+=("$_w"); break; }
-        done
-    fi
-    MISSING_OPTIONAL_COMMANDS=("${__kept[@]:-}")
-    unset __kept
-fi
 __arch_found=0
 for _a in 7z 7za unar bsdtar unrar; do have_cmd "$_a" && { __arch_found=1; break; }; done
 if (( __arch_found )); then
@@ -1252,7 +548,7 @@ if (( __arch_found )); then
     MISSING_OPTIONAL_COMMANDS=("${__kept[@]:-}")
     unset __kept
 fi
-unset __arch_found __widget_missing _w _a
+unset __arch_found _a
 
 if ((${#MISSING_OPTIONAL_COMMANDS[@]} > 0)); then
     log "INFO: Нет опциональных команд: ${MISSING_OPTIONAL_COMMANDS[*]} (будут использованы fallback-механизмы)"
@@ -1451,11 +747,10 @@ ensure_packages_present() {
 auto_install_dependencies() {
     local -a need_pkgs=()
     local spec c p
-    local -A opt_pkgs=([dialog]=1 [libnotify]=1 [qarma]=1 [yad]=1 [zenity]=1 [kdialog]=1)
+    local -A opt_pkgs=([dialog]=1)
     for spec in "${DEPENDENCY_SPECS[@]}"; do
         c="${spec%%|*}"; p="${spec#*|}"
         if ! have_cmd "$c"; then
-            [[ "${ALT_SYNC_GUI:-0}" == "1" && -n "${opt_pkgs[$p]:-}" ]] && continue
             need_pkgs+=("$p")
         fi
     done
@@ -4420,9 +3715,7 @@ prepare_export() {
     fi
 
     local full_auto=0
-    if [[ "$NONINTERACTIVE" == "1" && "${ALT_SYNC_GUI:-0}" == "1" ]]; then
-        full_auto=1
-    elif [[ "$NONINTERACTIVE" == "1" && "${ALT_SYNC_ASSUME_YES:-0}" != "1" && ! -t 0 ]]; then
+    if [[ "$NONINTERACTIVE" == "1" ]]; then
         full_auto=1
     fi
 
@@ -4481,7 +3774,7 @@ prepare_export() {
 }
 
 prepare_import_interactive() {
-    if [[ "$NONINTERACTIVE" == "1" && "${ALT_SYNC_GUI:-0}" == "1" ]]; then
+    if [[ "$NONINTERACTIVE" == "1" ]]; then
         OPT_VERIFY_BACKUP=1
         OPT_SNAPSHOT=1
         OPT_SKIP_VENDOR_RESTORE=0
@@ -4568,7 +3861,7 @@ prepare_import_offline() {
     OPT_VERIFY_BACKUP=1
     OPT_SNAPSHOT=1
 
-    if [[ "$NONINTERACTIVE" == "1" && "${ALT_SYNC_GUI:-0}" == "1" ]]; then
+    if [[ "$NONINTERACTIVE" == "1" ]]; then
         OPT_SKIP_VENDOR_RESTORE=0
         OPT_USE_NETWORK_IMPORT=0
         OPT_NETWORK_ENABLED=0
@@ -4613,7 +3906,7 @@ prepare_import_offline() {
 }
 
 prepare_crypto_interactive() {
-    if [[ "$NONINTERACTIVE" == "1" && "${ALT_SYNC_GUI:-0}" == "1" ]]; then
+    if [[ "$NONINTERACTIVE" == "1" ]]; then
         OPT_NETWORK_ENABLED=1
         SYSTEM_LISTS_UPDATED=0
         OPT_FORCE_CRYPTO_INSTALLER=0
@@ -4645,28 +3938,36 @@ prepare_crypto_interactive() {
 }
 
 show_menu() {
-    printf '\n%b\n' "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║      ALT LINUX UNIVERSAL SYNC / EXACT HARDWARE       ║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}1${NC}) Экспорт эталона: с докачкой недостающих RPM     ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}2${NC}) Экспорт эталона: только локальные RPM            ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${YELLOW}3${NC}) Импорт на копию железа: интерактивный            ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${YELLOW}4${NC}) Импорт на копию железа: полностью офлайн       ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${BLUE}5${NC}) Только CryptoPro + доп. RPM                    ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${CYAN}6${NC}) Проверить бэкап                                ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}7${NC}) Скачать компоненты в офлайн-кэш (нужен инет)  ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${RED}0${NC}) Выход                                          ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
+    clear 2>/dev/null || printf '\n\n'
+    printf '%b\n' "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║   ALT LINUX UNIVERSAL SYNC v$SCRIPT_VERSION (консоль)        ║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}1${NC}) Экспорт эталона: с докачкой недостающих RPM            ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}2${NC}) Экспорт эталона: только локальные RPM                  ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${YELLOW}3${NC}) Импорт на копию железа: интерактивный                  ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${YELLOW}4${NC}) Импорт на копию железа: полностью офлайн               ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${BLUE}5${NC}) Только CryptoPro + доп. RPM                            ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${CYAN}6${NC}) Проверить бэкап (целостность)                          ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}7${NC}) Скачать компоненты в офлайн-кэш (нужен интернет)       ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${MAGENTA}8${NC}) Сводка системы и текущих настроек                      ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${RED}0${NC}) Выход                                                  ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
-    printf '%b\n' "  ${BOLD}Скрипт:${NC} $SELF"
-    printf '%b\n' "  ${BOLD}Бэкап:${NC} $BACKUP_DIR"
-    printf '%b\n' "  ${BOLD}Лог:${NC} $LOG_FILE"
+    printf '%b\n' "  ${BOLD}Скрипт:${NC}   $SELF"
+    printf '%b\n' "  ${BOLD}Бэкап:${NC}    $BACKUP_DIR"
+    printf '%b\n' "  ${BOLD}Лог:${NC}      $LOG_FILE"
+    if [[ $EUID -eq 0 ]]; then
+        printf '%b\n' "  ${BOLD}Права:${NC}    ${GREEN}root ✓${NC}"
+    else
+        printf '%b\n' "  ${BOLD}Права:${NC}    ${RED}нет root ✗${NC}"
+    fi
+
     if deps_cache_available; then
         local nrpm
         nrpm="$(find "$DEPS_CACHE_DIR" -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l)"
         printf '%b\n' "  ${BOLD}Офлайн-кэш зависимостей:${NC} ${GREEN}${nrpm} RPM${NC} ($DEPS_CACHE_DIR)"
     else
-        printf '%b\n' "  ${BOLD}Офлайн-кэш зависимостей:${NC} ${YELLOW}отсутствует${NC} (на эталоне выполните: sudo $SELF fetch-deps)"
+        printf '%b\n' "  ${BOLD}Офлайн-кэш зависимостей:${NC} ${YELLOW}отсутствует${NC} (на эталоне выполните п.7 или: sudo bash $SELF fetch-deps)"
     fi
 
     if [[ -d "$PACKAGES_DIR" ]]; then
@@ -4674,6 +3975,8 @@ show_menu() {
         npkg="$(find "$PACKAGES_DIR" -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l)"
         nfree="$(df -Pm "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
         printf '%b\n' "  ${BOLD}Пакеты в бэкапе:${NC} ${npkg:-0} RPM ${CYAN}(свободно на диске: ${nfree:-?} МБ)${NC}"
+    else
+        printf '%b\n' "  ${BOLD}Пакеты в бэкапе:${NC} ещё не созданы (выполните экспорт — п.1 или п.2)"
     fi
 
     if [[ -r "$MACHINE_ID_FILE" ]]; then
@@ -4681,9 +3984,9 @@ show_menu() {
         cur="$(generate_machine_id)"
         stor="$(tr -d '\r\n ' < "$MACHINE_ID_FILE" 2>/dev/null || true)"
         if [[ "$cur" == "$stor" ]]; then
-            printf '%b\n' "  🔒 Статус: ${GREEN}Эталон совпадает${NC}"
+            printf '%b\n' "  🔒 Статус: ${GREEN}Эталон совпадает с этим железом${NC}"
         else
-            printf '%b\n' "  🔒 Статус: ${RED}Чужая машина${NC}"
+            printf '%b\n' "  🔒 Статус: ${RED}Чужая машина (маркер эталона не совпадает)${NC}"
         fi
     elif [[ -f "$MACHINE_ID_FILE" ]]; then
         printf '%b\n' "  🔒 Статус: ${YELLOW}Маркер существует, но не читается${NC}"
@@ -4694,15 +3997,68 @@ show_menu() {
     echo
 }
 
+pause_console() {
+    [[ -t 0 ]] || return 0
+    printf '\n%s' "  Нажмите ENTER для возврата в меню…"
+    IFS= read -r _ || true
+}
+
+system_summary() {
+    printf '\n%b\n' "${BOLD}${CYAN}━━━ Сводка системы ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    printf '  Хост:              %s\n' "$(hostname 2>/dev/null || echo '?')"
+    local osname
+    osname="$(grep -m1 PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)"
+    printf '  ОС:                %s\n' "${osname:-?}"
+    printf '  Ядро:              %s\n' "$(uname -r 2>/dev/null || echo '?')"
+    printf '  Пользователь:      %s (uid=%s)\n' "$(id -un)" "$(id -u)"
+    if [[ $EUID -eq 0 ]]; then
+        printf '  Root-права:        да\n'
+    else
+        printf '  Root-права:        НЕТ — часть операций будет недоступна\n'
+    fi
+    printf '  Каталог скрипта:   %s\n' "$SCRIPT_DIR"
+    printf '  Каталог бэкапа:    %s\n' "$BACKUP_DIR"
+    printf '  Текущий лог:       %s\n' "$LOG_FILE"
+    printf '  Последний лог:     %s\n' "$LOG_DIR/alt_sync_latest.log"
+    local ncpu ram diskfree
+    ncpu="$(nproc 2>/dev/null || echo '?')"
+    ram="$(free -h 2>/dev/null | awk '/^Mem:/{print $2"/"$7}')"
+    diskfree="$(df -Ph "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+    printf '  CPU: %s ядер | RAM всего/свободно: %s | свободно на диске бэкапа: %s\n' \
+        "$ncpu" "${ram:-?}" "${diskfree:-?}"
+    if command -v nmcli >/dev/null 2>&1; then
+        local nst
+        nst="$(nmcli -t -f STATE networking status 2>/dev/null | head -1)"
+        printf '  Сеть (NetworkManager): %s\n' "${nst:-неизвестно}"
+    fi
+    if [[ -d "$PACKAGES_DIR" ]]; then
+        local npkg nbak
+        npkg="$(find "$PACKAGES_DIR" -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l)"
+        nbak="$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)"
+        printf '  Бэкап:             %s RPM, общий размер ~%s\n' "$npkg" "${nbak:-?}"
+    fi
+    if deps_cache_available; then
+        local ndep
+        ndep="$(find "$DEPS_CACHE_DIR" -maxdepth 1 \( -name '*.rpm' -o -name '*.deb' \) 2>/dev/null | wc -l)"
+        printf '  Офлайн-кэш:        %s пакетов (%s)\n' "$ndep" "$DEPS_CACHE_DIR"
+    fi
+    if [[ -r "$MACHINE_ID_FILE" ]]; then
+        printf '  Маркер эталона:    %s\n' "$(head -c 64 "$MACHINE_ID_FILE" 2>/dev/null)"
+    fi
+    printf '  Версия скрипта:    %s\n' "$SCRIPT_VERSION"
+    printf '%b\n' "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    pause_console
+}
+
 usage() {
     cat <<EOF
-ALT Linux Universal Sync v$SCRIPT_VERSION
+ALT Linux Universal Sync v$SCRIPT_VERSION — консольная версия (GUI-оболочка удалена)
 
-Интерактивный запуск (по умолчанию):
-  $0
+Интерактивный запуск (меню в терминале):
+  sudo bash $0
 
 CLI-режим (для автоматизации; без аргументов — интерактивное меню):
-  $0 <действие> [флаги]
+  sudo bash $0 <действие> [флаги]
 
 Действия:
   export            Экспорт эталона (аналог меню 1, с докачкой RPM из сети)
@@ -4717,77 +4073,54 @@ CLI-режим (для автоматизации; без аргументов �
 
 Флаги:
   -y, --yes         Неинтерактивный режим: на все вопросы отвечать «да»
-                    (эквивалентно ALT_SYNC_NONINTERACTIVE=1)
-      --defaults    Неинтерактивный режим: использовать значения по умолчанию
-                    каждого вопроса (безопаснее для импорта)
-      --with-network-keys
-                    Включить в экспорт Wi-Fi пароли NetworkManager (секреты!)
-      --with-mozilla
-                    Включить в экспорт ~/.mozilla — профили браузера (секреты!)
-      --user NAME   Пользователь, чей профиль бэкапится/восстанавливается
-                    (эквивалентно ALT_SYNC_TARGET_USER)
-      --backup-dir DIR  Каталог бэкапа (по умолчанию рядом со скриптом;
-                    эквивалентно ALT_SYNC_BACKUP_DIR)
+      --defaults    Неинтерактивный режим: значения по умолчанию каждого вопроса
+      --with-network-keys    Включить в экспорт Wi-Fi пароли NetworkManager (секреты!)
+      --without-network-keys Не включать Wi-Fi пароли (по умолчанию)
+      --with-mozilla         Включить в экспорт ~/.mozilla — профили браузера (секреты!)
+      --without-mozilla      Не включать ~/.mozilla (по умолчанию)
+      --user NAME            Пользователь, чей профиль бэкапится/восстанавливается
+      --backup-dir DIR       Каталог бэкапа (по умолчанию рядом со скриптом)
+      --no-color             Отключить цветной вывод
   -h, --help        Эта справка
+  -V, --version     Версия
 
 Переменные окружения:
-  ALT_SYNC_NONINTERACTIVE=1   То же, что --yes/--defaults
-  ALT_SYNC_TARGET_USER=name   Целевой пользователь профиля
-  ALT_SYNC_BACKUP_DIR=DIR     Каталог бэкапа (то же, что --backup-dir)
-  ALT_SYNC_BACKUP_NETWORK_KEYS=1
-                              То же, что --with-network-keys
-  ALT_SYNC_BACKUP_MOZILLA=1   То же, что --with-mozilla
-  ALT_SYNC_APT_INTERACTIVE=1  Разрешить диалоги apt (по умолчанию все
-                              вызовы apt/rpm полностью неинтерактивны:
-                              DEBIAN_FRONTEND=noninteractive, Assume-Yes,
-                              force-confold — чтобы не плодить всплывающие
-                              окна в графической сессии)
-  ALT_SYNC_DEPS_CACHE_DIR=DIR Каталог офлайн-кэша зависимостей
-                    (по умолчанию <каталог скрипта>/deps-rpm)
-  ALT_SYNC_NO_AUTOINSTALL=1
-                              Полностью отключить автоустановку зависимостей
-                              (ни из офлайн-кэша, ни из сети) — для тестов и
-                              отладки; скрипт работает с fallback-механизмами
-  ALT_SYNC_SCRIPT_DIR=DIR     Явно задать каталог скрипта (куда пишутся логи
-                              и отчёты); используется при рестарте от root
-                              через sudo/su/pkexec
-  ALT_SYNC_GUI=1              Режим GUI-оболочки: при отсутствии прав root
-                              пароль запрашивается ГРАФИЧЕСКИМ окном (zenity/
-                              yad/kdialog/qarma/xmessage) и передаётся в
-                              sudo -S по stdin; терминального ввода не нужно.
-                              ALT_SYNC_ASKPASS_BIN=<виджет> — подсказка, каким
-                              именно диалогом спрашивать пароль (ставит GUI).
-  ALT_SYNC_LOG_FILE           Полный путь к текущему техлогу (задаётся
-                              автоматически; можно читать извне)
-  NO_COLOR=1                  Отключить цветной вывод
+  ALT_SYNC_NONINTERACTIVE=1       То же, что --yes/--defaults
+  ALT_SYNC_TARGET_USER=name       Целевой пользователь профиля
+  ALT_SYNC_BACKUP_DIR=DIR         Каталог бэкапа (то же, что --backup-dir)
+  ALT_SYNC_BACKUP_NETWORK_KEYS=1  То же, что --with-network-keys
+  ALT_SYNC_BACKUP_MOZILLA=1       То же, что --with-mozilla
+  ALT_SYNC_ALLOW_ROOT_RESTART=0   Запретить автоперезапуск через sudo/pkexec/su
+  ALT_SYNC_NO_ESCALATE=1          Работать без повышения прав (предупреждение)
+  ALT_SYNC_NO_AUTOINSTALL=1       Отключить автоустановку зависимостей
+  ALT_SYNC_DEPS_CACHE_DIR=DIR     Каталог офлайн-кэша зависимостей
+  ALT_SYNC_APT_INTERACTIVE=1      Разрешить диалоги apt (по умолчанию неинтерактивно)
+  NO_COLOR=1                      Отключить цветной вывод
+
+Прогресс и отмена (консольный аналог окна прогресса прежней GUI-версии):
+  • каждый шаг печатается с нумерацией «Шаг N/M», временем и процентом прогресса;
+  • весь вывод дублируется в техлог (путь виден в меню и в начале работы);
+  • отмена — Ctrl+C: скрипт корректно останавливается на ближайшей контрольной
+    точке и пишет «CANCEL» в лог;
+  • итоговый отчёт OK/WARN/FAIL выводится в конце каждой задачи.
 
 Логирование:
-  Все логи пишутся РЯДОМ СО СКРИПТОМ: techлог alt_sync_<дата>_<время>_<pid>.log,
-  итоговые отчёты alt_sync_report_*.txt, hardware_diff.txt и т.д. — в том же
-  каталоге, что и сам alt_sync.sh (при недоступности — ./logs, затем /tmp).
+  Логи пишутся РЯДОМ СО СКРИПТОМ в каталоге logs/ (при недоступности — /tmp):
+  techлог alt_sync_<дата>_<время>_<pid>.log, ссылка на последний — alt_sync_latest.log,
+  итоговые отчёты alt_sync_report_*.txt, hardware_diff.txt и т.д.
 
 Примеры:
-  $0 export --yes                       # полностью автоматический экспорт
-  $0 import-offline --defaults --user ivan
-  sudo ALT_SYNC_NONINTERACTIVE=1 $0 verify
-  sudo $0 fetch-deps                          # эталон: скачать кэш зависимостей
-  # ...перенести папку со скриптом и deps-rpm/ на машины без сети...
+  sudo bash $0                                # интерактивное меню
+  sudo bash $0 export --yes                   # полностью автоматический экспорт
+  sudo bash $0 export --with-network-keys --with-mozilla --user ivan
+  sudo bash $0 import-offline --defaults --user ivan
+  sudo bash $0 verify
+  sudo bash $0 fetch-deps                     # эталон: скачать кэш зависимостей
 EOF
 }
 
 main() {
     local action=""
-
-    _gui_release_ownership() {
-        [[ -n "${GUI_CHOWN_OWNER:-}" ]] || return 0
-        local d
-        for d in "$BACKUP_DIR" "$LOG_DIR"; do
-            [[ -d "$d" ]] || continue
-            chown -R "$GUI_CHOWN_OWNER" "$d" 2>/dev/null || true
-        done
-        return 0
-    }
-    trap '_gui_release_ownership' EXIT
 
     if [[ -d "$DEPS_CACHE_DIR" ]] && ! have_cmd rpm && ! have_cmd epm \
         && find "$DEPS_CACHE_DIR" -maxdepth 1 -name '*.deb' -print -quit 2>/dev/null | grep -q .; then
@@ -4810,6 +4143,10 @@ main() {
                 ;;
             --defaults)
                 NONINTERACTIVE=1
+                ;;
+            --no-color)
+                NO_COLOR=1; export NO_COLOR
+                RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
                 ;;
             --with-network-keys)
                 OPT_BACKUP_NETWORK_KEYS=1
@@ -4844,15 +4181,6 @@ main() {
                 ;;
             --log-file=*)
                 export ALT_SYNC_LOG_FILE="${1#--log-file=}"
-                ;;
-            --cancel-flag)
-                if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
-                    export ALT_SYNC_CANCEL_FLAG="$2"
-                    shift
-                fi
-                ;;
-            --cancel-flag=*)
-                export ALT_SYNC_CANCEL_FLAG="${1#--cancel-flag=}"
                 ;;
             --script-dir)
                 if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
@@ -4889,7 +4217,7 @@ main() {
                     die "Нельзя указать два действия одновременно: '$action' и '$1'"
                 fi
                 action="$1"
-                if [[ "${ALT_SYNC_GUI:-0}" == "1" || "${ALT_SYNC_ELEVATED:-0}" == "1" ]]; then
+                if [[ "${ALT_SYNC_ELEVATED:-0}" == "1" ]]; then
                     NONINTERACTIVE=1
                     case "$action" in
                         import|import-offline) : ;;
@@ -4940,7 +4268,7 @@ main() {
             log "INFO: ALT_SYNC_NO_AUTOINSTALL=1 — автоустановка зависимостей отключена; использую доступные механизмы."
         elif [[ "${ALT_SYNC_ALLOW_NET:-0}" == "1" ]]; then
             net_allowed=1
-        elif [[ "$NONINTERACTIVE" != "1" && "${ALT_SYNC_GUI:-0}" != "1" && -t 0 ]]; then
+        elif [[ "$NONINTERACTIVE" != "1" && -t 0 ]]; then
             if ask_yes_no "Не хватает зависимостей (${MISSING_BOOTSTRAP[*]:-}${MISSING_OPTIONAL_COMMANDS[*]:-}). Установить их из репозитория? (нужен интернет)" y; then
                 net_allowed=1
             fi
@@ -5002,11 +4330,6 @@ main() {
         return "$rc"
     fi
 
-    if [[ "${ALT_SYNC_GUI:-0}" == "1" ]]; then
-        printf '%s ERROR: GUI-оболочка не передала действие бэкенду (пустая команда задачи).\n' "$(date '+%F %T')" >&2
-        log "ERROR: GUI mode without action argument — exiting instead of showing invisible interactive menu."
-        return 3
-    fi
     # Защита от «невидимого» интерактивного меню: если stdin не терминал
     # (например, /dev/null из GUI-обёртки), read мгновенно завершится ошибкой
     # и скрипт бесконечно перерисует меню. В таком окружении показывать TUI
@@ -5022,11 +4345,11 @@ main() {
 
         local choice=""
         if [[ -n "$INPUT_TTY" ]]; then
-            if ! read -rp "  Выбор [0-7]: " choice <"$INPUT_TTY"; then
+            if ! read -rp "  Выбор [0-8]: " choice <"$INPUT_TTY"; then
                 echo
                 exit 0
             fi
-        elif ! read -rp "  Выбор [0-7]: " choice; then
+        elif ! read -rp "  Выбор [0-8]: " choice; then
             echo
             exit 0
         fi
@@ -5073,11 +4396,16 @@ main() {
                 if ! do_verify; then
                     step_warn "Проверка бэкапа не пройдена."
                 fi
+                pause_console
                 ;;
             7)
                 if ! fetch_deps_cache; then
                     step_warn "Скачивание офлайн-кэша завершилось с ошибками."
                 fi
+                pause_console
+                ;;
+            8)
+                system_summary
                 ;;
             0)
                 exit 0
