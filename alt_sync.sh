@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.0-console"
+SCRIPT_VERSION="2.0.1-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -47,15 +47,36 @@ if [[ $EUID -ne 0 ]]; then
         _args_q=""
         for _a in "$@"; do _args_q+=" $(printf '%q' "$_a")"; done
         unset _a
+        # Определяем, реально ли доступен sudo этому пользователю:
+        # в Astra/ALT обычный пользователь может отсутствовать в sudoers —
+        # тогда «sudo» выдаст «astra отсутствует в файле sudoers» и ничего не запустится.
+        _sudo_usable=0
         if command -v sudo >/dev/null 2>&1; then
+            if sudo -n true 2>/dev/null; then
+                _sudo_usable=1
+            elif [[ -r /etc/sudoers ]] || grep -qsE '^[[:space:]]*%?(wheel|sudo|adm)\b' /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then
+                # sudoers читается и в нём есть группы администраторов —
+                # считаем sudo потенциально рабочим (пользователь может состоять в группе).
+                if [[ "$(id -nG 2>/dev/null)" == *" wheel"* || "$(id -nG)" == *"wheel "* || "$(id -nG)" =~ (^| )wheel($| ) || "$(id -nG)" =~ (^| )(sudo|adm)($| ) ]]; then
+                    _sudo_usable=1
+                fi
+            fi
+        fi
+        if [[ "$_sudo_usable" == "1" ]]; then
             printf 'Для работы нужны права root — перезапускаюсь через sudo (введите пароль при запросе)...\n' >&2
             exec sudo "${_as_env[@]}" bash "$SELF" "$@"
-        elif command -v pkexec >/dev/null 2>&1; then
-            printf 'Для работы нужны права root — перезапускаюсь через pkexec...\n' >&2
-            exec pkexec env "${_as_env[@]}" bash "$SELF" "$@"
         elif command -v su >/dev/null 2>&1; then
-            printf 'Для работы нужны права root — перезапускаюсь через su (введите пароль root)...\n' >&2
+            printf 'Для работы нужны права root — перезапускаюсь через su (введите пароль суперпользователя/root)...\n' >&2
             exec su -c "env ${_as_env[*]} bash $_self_q${_args_q}" root
+        elif command -v pkexec >/dev/null 2>&1; then
+            printf 'Для работы нужны права root — перезапускаюсь через pkexec (диалог ввода пароля)...\n' >&2
+            exec pkexec env "${_as_env[@]}" bash "$SELF" "$@"
+        elif command -v sudo >/dev/null 2>&1; then
+            # sudo есть, но пользователь, скорее всего, не в sudoers — пробуем, но предупреждаем
+            printf 'Для работы нужны права root — перезапускаюсь через sudo...\n' >&2
+            printf 'ВНИМАНИЕ: похоже, ваш пользователь не настроен для sudo. Если появится\n' >&2
+            printf '«отсутствует в файле sudoers» — запустите вручную: su -c "bash %s"\n' "$SELF" >&2
+            exec sudo "${_as_env[@]}" bash "$SELF" "$@"
         else
             printf 'ОШИБКА: требуются права root, но ни sudo, ни pkexec, ни su не найдены.\n' >&2
             printf 'Запустите вручную: su -c "bash %s %s"\n' "$SELF" "$*" >&2
@@ -4038,26 +4059,35 @@ create_desktop_shortcut() {
         return 1
     fi
 
-    local term_exec="x-terminal-emulator"
+    local term_exec=""
     local t
-    for t in gnome-terminal konsole xfce4-terminal mate-terminal lxterminal qterminal yterm alacritty kitty xterm; do
+    for t in gnome-terminal konsole xfce4-terminal mate-terminal lxterminal qterminal yterm st alacritty kitty xterm; do
         if command -v "$t" >/dev/null 2>&1; then term_exec="$t"; break; fi
     done
-
-    # Команда внутри терминала: перезапуск от root через sudo (или pkexec), либо напрямую если уже root
-    local run_cmd
-    if command -v sudo >/dev/null 2>&1; then
-        run_cmd="sudo bash '$SELF'"
-    elif command -v pkexec >/dev/null 2>&1; then
-        run_cmd="pkenv=\$(for v in DISPLAY XAUTHORITY; do eval \"val=\\\$\$v\"; [ -n \"\$val\" ] && printf '%s=%s ' \"\$v\" \"\$val\"; done); pkenv=\"\${pkenv% }\" pkenv=\"\$pkenv ALT_SYNC_ALLOW_ROOT_RESTART=0\" pkexec env \$pkenv bash '$SELF'"
-    else
-        run_cmd="bash '$SELF'"
+    # x-terminal-emulator — только если он реально существует в системе
+    if [[ -z "$term_exec" ]] && command -v x-terminal-emulator >/dev/null 2>&1; then
+        term_exec="x-terminal-emulator"
     fi
+    if [[ -z "$term_exec" ]]; then
+        step_warn "Терминал не найден (gnome-terminal/konsole/xfce4-terminal/xterm...)."
+        step_warn "Ярлык создаётся с x-terminal-emulator: без терминала запуск по двойному клику не откроет окно."
+        term_exec="x-terminal-emulator"
+    fi
+
+    # Команда внутри терминала: повышение прав выполняет сам скрипт
+    # (sudo -> su -> pkexec с учётом sudoers), поэтому здесь просто bash.
+    local run_cmd="bash '$SELF'"
 
     local launch_line
     case "$term_exec" in
-        gnome-terminal|x-terminal-emulator) launch_line="$term_exec -- bash -lc \"$run_cmd\"" ;;
-        *)                                   launch_line="$term_exec -e bash -lc \"$run_cmd\"" ;;
+        gnome-terminal|x-terminal-emulator|mate-terminal)
+            launch_line="$term_exec -- bash -lc \"$run_cmd\"" ;;
+        yterm)
+            launch_line="$term_exec bash -lc \"$run_cmd\"" ;;
+        konsole|xfce4-terminal|qterminal|lxterminal|st|alacritty|kitty|xterm)
+            launch_line="$term_exec -e bash -lc \"$run_cmd\"" ;;
+        *)
+            launch_line="$term_exec -e bash -lc \"$run_cmd\"" ;;
     esac
 
     local desktop_name="ALT Linux Universal Sync"
