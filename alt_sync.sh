@@ -19,13 +19,17 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.4-console"
+SCRIPT_VERSION="2.0.5-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
 if [[ "$SELF" != /* ]]; then
     SELF="$SCRIPT_DIR/$SELF"
 fi
+# Экранированная версия пути для вложения в «bash -lc "...» внутри Exec= ярлыка:
+# двойные кавычки шелла -lc раскроются, и путь с пробелами/спецсимволами
+# дойдёт до bash целым аргументом.
+printf -v SELF_NO_ESCAPE '%q' "$SELF"
 
 if [[ "$SCRIPT_DIR" == *[[:space:]]* || "$SELF" == *[[:space:]]* ]]; then
     printf 'Путь к скрипту не должен содержать пробелы/табуляцию: %s\n' "$SELF" >&2
@@ -225,54 +229,72 @@ log() {
 
 log "INIT: alt_sync v$SCRIPT_VERSION запущен (pid=$$, uid=$(id -u), лог=$LOG_FILE)"
 
-if [[ -t 1 && -r /dev/tty && -w /dev/tty ]] && command -v sed >/dev/null 2>&1; then
-    exec 3>&1
-    exec > >(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\x1b\[K//g' \
-              | tee -a "$LOG_FILE" >&3) 2>&1
-else
-    if command -v sed >/dev/null 2>&1; then
-        exec > >(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\x1b\[K//g' >> "$LOG_FILE") 2>&1
-    else
-        exec >> "$LOG_FILE" 2>&1
-    fi
-fi
+# ─── Определение терминала ввода/вывода ──────────────────────────────────────
+# ВАЖНО (v2.0.5): при запуске через ярлык вида
+#   konsole -e bash -lc "su -c 'bash alt_sync.sh'"
+# su ПЕРЕКРЫВАЕТ свой управляющий запрос пароля на /dev/tty (как makebase в
+# util-linux), и после ввода пароля read с /dev/tty возвращает EIO
+# («read: ошибка чтения: 0: Ошибка ввода/вывода») — меню мгновенно гибнет,
+# окно «висит», а логи продолжают писаться. Поэтому:
+#   1) если stdin является терминалом (-t 0) — читаем ВВОД из stdin: именно
+#      его су/терминал гарантирует нам после завершения своей работы;
+#   2) только если stdin НЕ терминал, пробуем /dev/tty;
+#   3) дублирование ВЫВОДА в лог делаем БЕЗ process substitution и без
+#      переназначения fd 3 (см. ниже) — раньше это ломало терминальный вывод.
 INPUT_TTY=""
-# ВАЖНО: определяем доступность /dev/tty НЕЗАВИСИМО от «-t 0». При запуске
-# через ярлык вида «konsole -e bash -lc "su -c '...'"» su передаёт stdin как
-# есть, но в некоторых конфигурациях (другие терминалы/обёртки) stdin может
-# не быть терминалом, тогда как /dev/tty полностью доступен. Прежняя проверка
-# «[[ -t 0 ]] && ...» в этом случае обнуляла INPUT_TTY, ask_yes_no уходил в
-# «неинтерактивный» режим и молча отвечал сам — пользователь не видел ни
-# приветствия, ни меню, хотя скрипт работал и писал логи («зависшее окно»).
-if [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
+INTERACTIVE=0
+if [[ -t 0 ]]; then
+    INTERACTIVE=1
+elif [[ -r /dev/tty ]] && [[ -w /dev/tty ]]; then
+    INTERACTIVE=1
     INPUT_TTY="/dev/tty"
 fi
-# ВАЖНО: здесь НЕЛЬЗЯ делать «exec 3</dev/tty». Выше (строка ~227) дескриптор 3
-# уже занят каналом вывода в терминал («exec 3>&1», используется конвейером
-# tee для показа меню). Переназначение fd 3 на файл ввода ломало вывод:
-# окно терминала «зависало» (меню не печаталось), хотя логи продолжали писаться.
-# Чтение ввода везде идёт через read ... <"$INPUT_TTY", отдельный fd не нужен.
-#
-# ВАЖНО (v2.0.3): переменную INPUT_TTY больше НЕ экспортируем. Экспорт
-# «INPUT_TTY=/dev/tty» в окружение дочерних процессов приводил к конфликту с
-# systemd-юнитами и утилитами, использующими собственную переменную окружения
-# InputTTY/INPUT_TTY; при завершении дочернего процесса родительский шелл мог
-# получить ошибочное состояние и окно закрывалось сразу после баннера.
-# Функции ask_yes_no/pause_console используют глобальную переменную этого же
-# процесса — export для них не требуется.
+
+# Функция чтения пользовательского ввода: корректно работает и при
+# «stdin = TTY», и при «только /dev/tty доступен», и в неинтерактивном режиме.
+# Возвращает 0 при успешном чтении строки (строка — в переменной REPLY_OUT),
+# 1 при EOF/ошибке чтения.
+# ВАЖНО: read вызывается ВНУТРИ функции без редиректа, когда stdin уже
+# перенаправлен на терминал — так read получает tty напрямую (и readline, и
+# сигналы работают штатно).
+read_user_input() {
+    local __prompt="${1:-}"
+    REPLY_OUT=""
+    if [[ "$NONINTERACTIVE" == "1" || "$INTERACTIVE" != "1" ]]; then
+        return 1
+    fi
+    if [[ -n "$INPUT_TTY" ]]; then
+        # stdin не терминал — читаем из /dev/tty редиректом
+        if [[ -n "$__prompt" ]]; then
+            IFS= read -r REPLY_OUT -p "$__prompt" <"$INPUT_TTY" || return 1
+        else
+            IFS= read -r REPLY_OUT <"$INPUT_TTY" || return 1
+        fi
+    else
+        # stdin — терминал: read без редиректа читает прямо с tty
+        if [[ -n "$__prompt" ]]; then
+            IFS= read -r REPLY_OUT -p "$__prompt" || return 1
+        else
+            IFS= read -r REPLY_OUT || return 1
+        fi
+    fi
+    return 0
+}
+
+# Дублирование вывода в лог реализовано в КОНЦЕ файла (точка входа): скрипт
+# перезапускает сам себя (флаг ALT_SYNC_LOGPIPE=1 защищает от рекурсии) внутри
+# конвейера sed|tee. Свой stdout/stderr текущий процесс НЕ перехватывает через
+# «exec > >(...)», и «exec 3</dev/tty» нигде не делается: process substitution
+# перехватывала дескрипторы и конфликтовала с терминальным чтением — read
+# возвращал EIO («ошибка чтения: 0»), окно выглядело зависшим при живых логах.
+# Внутри перезапуска stdin наследуется как есть (TTY), поэтому read_user_input
+# читает с терминала штатно.
+
 export -n INPUT_TTY 2>/dev/null || true
 
 _finish_log() {
     local rc=$?
     printf '%s INFO: Завершение работы (exit code %s)\n' "$(date '+%F %T')" "$rc" >> "$LOG_FILE" 2>/dev/null || true
-    # process-substitution (`exec > >(sed … | tee …)`) оставляет фоновый конвейер,
-    # который может ещё не дописать буфер в терминал. Ждём его с КОРОТКИМ
-    # таймаутом и гарантированно гасим, иначе при закрытии окна часть вывода
-    # терялась, а в редких случаях шелл «зависал» на wait.
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 3 bash -c 'wait' 2>/dev/null || true
-    fi
-    wait 2>/dev/null || true
 }
 trap _finish_log EXIT
 
@@ -393,11 +415,12 @@ ask_yes_no() {
 
     printf '%s %s ' "$prompt" "$hint"
 
-    # ВАЖНО: проверять нужно сам INPUT_TTY, а не «-t 0»: после «su -c» или в
-    # части GUI-обёрток stdin может не быть терминалом (-t 0 ложен), тогда как
-    # /dev/tty доступен. Из-за прежней проверки скрипт уходил в «неинтерактивный
-    # режим» и молча отвечал сам — пользователь не видел ни меню, ни вопросов.
-    if [[ "$NONINTERACTIVE" == "1" ]] || [[ -z "$INPUT_TTY" ]]; then
+    # ВАЖНО (v2.0.5): интерактивность определяется через INTERACTIVE
+    # («stdin = TTY» ИЛИ доступен /dev/tty) — см. начало файла. Прежняя
+    # проверка «-z "$INPUT_TTY"» при stdin=TTY была ложной и уходила в
+    # автоответ; обратный случай (su перекрывает /dev/tty своим запросом
+    # пароля → EIO) лечится тем, что читаем из stdin, а не из /dev/tty.
+    if [[ "$NONINTERACTIVE" == "1" ]] || [[ "$INTERACTIVE" != "1" ]]; then
         local eff="$def"
         if [[ "${ALT_SYNC_ASSUME_YES:-0}" == "1" ]]; then
             eff="y"
@@ -410,8 +433,8 @@ ask_yes_no() {
         return 1
     fi
 
-    local rc=0 ans_is_eof=0
-    if ! IFS= read -r ans <"$INPUT_TTY"; then
+    local rc=0 ans_is_eof=0 ans=""
+    if ! read_user_input ""; then
         rc=$?
         printf '\n'
         if (( rc > 1 )); then
@@ -419,7 +442,7 @@ ask_yes_no() {
             ans_is_eof=1
         fi
     else
-        ans="${ans:-}"
+        ans="$REPLY_OUT"
     fi
 
     ans="${ans//[[:space:]]/}"
@@ -585,13 +608,15 @@ require_commands() {
 require_commands "${REQUIRED_CORE_UTILS[@]}"
 
 HAVE_FLOCK=1; have_cmd flock || HAVE_FLOCK=0
+# ВАЖНО (v2.0.5): rpm/apt-get НЕ являются bootstrap-зависимостями — без них
+# меню, сводка системы, проверка бэкапа и ярлыки работают. Действия, которым
+# нужны пакетные инструменты (экспорт/импорт/CryptoPro), проверяют это сами
+# через require_pkg_tools() в момент запуска и дают понятную ошибку. Раньше
+# их отсутствие поднимало диалог автоустановки до показа меню.
 MISSING_BOOTSTRAP=()
-for _cmd in rpm apt-get; do
-    have_cmd "$_cmd" || MISSING_BOOTSTRAP+=("$_cmd")
-done
 unset _cmd
 
-OPTIONAL_COMMANDS=(gzip bzip2 xz zstd timeout unrar unar bsdtar 7z 7za unzip epm whiptail systemctl ldconfig udevadm)
+OPTIONAL_COMMANDS=(rpm apt-get gzip bzip2 xz zstd timeout unrar unar bsdtar 7z 7za unzip epm whiptail systemctl ldconfig udevadm)
 MISSING_OPTIONAL_COMMANDS=()
 for _cmd in "${OPTIONAL_COMMANDS[@]}"; do
     if ! have_cmd "$_cmd"; then
@@ -3768,23 +3793,17 @@ choose_target_user() {
             TARGET_USER="$default_user"
         else
             printf 'Введите имя пользователя: '
-            if [[ -n "$INPUT_TTY" ]]; then
-                if ! IFS= read -r TARGET_USER <"$INPUT_TTY"; then
-                    return 1
-                fi
-            elif ! IFS= read -r TARGET_USER; then
+            if ! read_user_input ""; then
                 return 1
             fi
+            TARGET_USER="$REPLY_OUT"
         fi
     else
         printf 'Введите имя пользователя для профиля: '
-        if [[ -n "$INPUT_TTY" ]]; then
-            if ! IFS= read -r TARGET_USER <"$INPUT_TTY"; then
-                return 1
-            fi
-        elif ! IFS= read -r TARGET_USER; then
+        if ! read_user_input ""; then
             return 1
         fi
+        TARGET_USER="$REPLY_OUT"
     fi
 
     TARGET_USER="$(printf '%s' "$TARGET_USER" | tr -d '[:space:]')"
@@ -4107,12 +4126,13 @@ show_menu() {
 }
 
 pause_console() {
-    # Проверять нужно INPUT_TTY, а не «-t 0»: после «su -c» stdin может не быть
-    # терминалом, тогда как /dev/tty доступен. Без паузы экран мгновенно
+    # v2.0.5: через read_user_input — работает и при stdin=TTY (случай
+    # «su -c» из konsole, где /dev/tty перекрыт su и даёт EIO), и при
+    # доступном только /dev/tty. Без паузы результат действия мгновенно
     # прокручивался и меню перерисовывалась в цикле — окно выглядело «зависшим».
-    [[ -n "$INPUT_TTY" ]] || return 0
+    [[ "$INTERACTIVE" == "1" && "$NONINTERACTIVE" != "1" ]] || return 0
     printf '\n%s' "  Нажмите ENTER для возврата в меню…"
-    IFS= read -r _ <"$INPUT_TTY" || true
+    read_user_input "" || true
 }
 
 # ─── Ярлык в графической оболочке (пункт меню 9) ──────────────────────────────
@@ -4171,7 +4191,10 @@ create_desktop_shortcut() {
 
     # Команда внутри терминала: повышение прав выполняет сам скрипт
     # (sudo -> su -> pkexec с учётом sudoers), поэтому здесь просто bash.
-    local run_cmd="bash '$SELF'"
+    # Путь экранирован через printf %q — корректно работает даже если он
+    # содержит пробелы или спецсимволы. Флаг NO_AUTOINSTALL НЕ подставляется:
+    # при отсутствии зависимостей скрипт сам спросит, установить ли их.
+    local run_cmd="env ALT_SYNC_LOGPIPE= bash '${SELF_NO_ESCAPE}'"
 
     local launch_line
     case "$term_exec" in
@@ -4508,8 +4531,8 @@ main() {
     # пользователь сразу видел меню/информацию в терминале (раньше при
     # ALT_SYNC_NO_AUTOINSTALL=1 вывод уходил только в лог, и окно казалось
     # «зависшим»).
-    printf 'alt_sync v%s | SELF=%s | BACKUP_DIR=%s | INPUT_TTY=%s\n' \
-        "$SCRIPT_VERSION" "$SELF" "$BACKUP_DIR" "${INPUT_TTY:-<нет>}"
+    printf 'alt_sync v%s | SELF=%s | BACKUP_DIR=%s | ТЕРМИНАЛ ВВОДА=%s\n' \
+        "$SCRIPT_VERSION" "$SELF" "$BACKUP_DIR" "$( [[ "$INTERACTIVE" == "1" ]] && { [[ -n "$INPUT_TTY" ]] && echo "/dev/tty" || echo "stdin(tty)"; } || echo "<нет>" )"
 
     if ((${#MISSING_BOOTSTRAP[@]} > 0)) || ((${#MISSING_OPTIONAL_COMMANDS[@]} > 0)); then
         local net_allowed=0
@@ -4517,7 +4540,7 @@ main() {
             log "INFO: ALT_SYNC_NO_AUTOINSTALL=1 — автоустановка зависимостей отключена; использую доступные механизмы."
         elif [[ "${ALT_SYNC_ALLOW_NET:-0}" == "1" ]]; then
             net_allowed=1
-        elif [[ "$NONINTERACTIVE" != "1" && -n "$INPUT_TTY" ]]; then
+        elif [[ "$NONINTERACTIVE" != "1" && "$INTERACTIVE" == "1" ]]; then
             if ask_yes_no "Не хватает зависимостей (${MISSING_BOOTSTRAP[*]:-} ${MISSING_OPTIONAL_COMMANDS[*]:-}). Установить их из репозитория? (нужен интернет)" y; then
                 net_allowed=1
             fi
@@ -4592,7 +4615,7 @@ main() {
     # ВАЖНО: раньше здесь было «[[ ! -t 0 && -z "$INPUT_TTY" ]]», но INPUT_TTY
     # сам вычисляется через «-t 0», поэтому при запуске через «su -c» из
     # konsole условие было ложным и управление всё равно уходило в die/.
-    if [[ ! -t 0 ]] && [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    if [[ "$INTERACTIVE" != "1" ]]; then
         printf '%s ERROR: Интерактивное меню недоступно: stdin не является терминалом.\n' "$(date '+%F %T')" >&2
         printf 'Запустите скрипт из терминала или передайте действие аргументом, например: sudo bash %s export --yes\n' "${BASH_SOURCE[0]}" >&2
         log "ERROR: Interactive menu requested without a TTY (stdin=$(readlink -f /proc/self/fd/0 2>/dev/null || echo unknown)) — refusing to hang."
@@ -4617,15 +4640,13 @@ main() {
         show_menu
 
         local choice=""
-        if [[ -n "$INPUT_TTY" ]]; then
-            if ! read -rp "  Выбор [0-9]: " choice <"$INPUT_TTY"; then
-                echo
-                exit 0
-            fi
-        elif ! read -rp "  Выбор [0-9]: " choice; then
+        # v2.0.5: читаем через read_user_input (stdin=TTY или /dev/tty —
+        # см. начало файла). Прямой «read ... </dev/tty» давал EIO после su.
+        if ! read_user_input "  Выбор [0-9]: "; then
             echo
             exit 0
         fi
+        choice="$REPLY_OUT"
 
         choice="$(printf '%s' "$choice" | tr -d '\r\n ')"
 
@@ -4700,5 +4721,35 @@ main() {
         esac
     done
 }
+
+# ─── Точка входа ──────────────────────────────────────────────────────────────
+# v2.0.5: дублирование вывода в лог — ЧИСТЫМ конвейером вокруг самого скрипта
+# (переэкзек себя), а НЕ «exec > >(…|tee…)»: process substitution оставляла
+# фоновый concheck и ломала терминальное чтение (read → EIO, «зависшее» окно
+# при пишущихся логах). Внутри конвейера stdin наследуется как есть (TTY),
+# поэтому read_user_input читает с терминала штатно.
+# Дочерний процесс наследует stdin КАК ЕСТЬ (TTY) — никакого перехвата его
+# дескрипторов; ANSI-коды вырезаются sed перед tee. Редирект stderr —
+# корректным синтаксисом «>… 2>&1» (запись «prog 2>&1 | tee» применила бы
+# редирект ПОСЛЕ построения конвейера, и stderr миновал бы tee).
+# ВАЖНО: stderr оборачивается редиректом ВО ВСЁЙ группы «{…} 2>&1», иначе
+# stderr дочернего процесса пошёл бы напрямую в терминал, минуя sed|tee.
+if [[ "${ALT_SYNC_LOGPIPE:-}" != "1" ]] && [[ "$INTERACTIVE" == "1" ]] && have_cmd tee && have_cmd sed; then
+    export ALT_SYNC_LOGPIPE=1
+    {
+        {
+            bash "${BASH_SOURCE[0]}" "$@" \
+                | sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\x1b\[K//g' \
+                | tee -a "$LOG_FILE"
+        }
+    } 2>&1
+    _as_rc=${PIPESTATUS[0]}
+    # дописываем код возврата дочернего процесса в лог
+    printf '%s INFO: Завершение работы (exit code %s)\n' "$(date '+%F %T')" "$_as_rc" >> "$LOG_FILE" 2>/dev/null || true
+    exit "$_as_rc"
+elif [[ "${ALT_SYNC_LOGPIPE:-}" != "1" ]] && [[ "$INTERACTIVE" != "1" ]]; then
+    # Неинтерактивно: весь вывод только в лог.
+    exec >> "$LOG_FILE" 2>&1
+fi
 
 main "$@"
