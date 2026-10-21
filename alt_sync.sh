@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.7-console"
+SCRIPT_VERSION="2.0.8-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -1944,6 +1944,55 @@ copy_all_rpm_sources() {
 
     if (( total > 0 && cur >= total )); then
         printf '\n'
+    fi
+
+    # v2.0.8: если из кэша (/var/cache/apt/archives) скопировано мало RPM —
+    # типичная ситуация для ALT, где apt удаляет .rpm после установки, —
+    # докачиваем недостающие ВАЖНЫЕ пакеты (список EPSON/PANTUM/CRYPTO и
+    # special_packages.txt) напрямую в packages/. Это позволяет развернуть
+    # Epson/Pantum на клиенте без интернета. Остальные ~4000 пакетов
+    # штатно берутся из репозиториев при импорте.
+    local important_file="$LISTS_DIR/special_packages.txt"
+    if [[ -d "$PACKAGES_DIR" ]] && have_cmd apt-get &&
+       (( OPT_NETWORK_ENABLED == 1 )); then
+        local -a imp_pkgs=()
+        local ipkg
+        while IFS= read -r ipkg; do
+            [[ -n "$ipkg" ]] && imp_pkgs+=("$ipkg")
+        done < <(
+            cat "$important_file" 2>/dev/null || true
+            printf '%s\n' "${EPSON_PKGS[@]}" "${PANTUM_PKGS[@]}" "${CRYPTO_PKGS[@]}"
+        )
+
+        # дедупликация
+        local -A imp_seen=()
+        local -a imp_uniq=()
+        for ipkg in "${imp_pkgs[@]}"; do
+            [[ -n "${imp_seen[$ipkg]:-}" ]] && continue
+            imp_seen["$ipkg"]=1
+            imp_uniq+=("$ipkg")
+        done
+
+        local dl_done=0 dl_fail=0
+        for ipkg in "${imp_uniq[@]}"; do
+            # уже есть локально?
+            if find "$PACKAGES_DIR" -maxdepth 1 -type f -iname "${ipkg}-*.rpm" 2>/dev/null | grep -q .; then
+                continue
+            fi
+            ALT_SYNC_ALLOW_NET=1; export ALT_SYNC_ALLOW_NET
+            if ( cd "$PACKAGES_DIR" && apt_with_timeout 300 "${APT_NET_OPTS[@]}" download "$ipkg" </dev/null >>"$LOG_FILE" 2>&1 ); then
+                dl_done=$((dl_done + 1))
+            else
+                dl_fail=$((dl_fail + 1))
+                log "INFO: важный пакет '$ipkg' недоступен для докачки (не найден в репозиториях)."
+            fi
+        done
+
+        if (( dl_done > 0 )); then
+            log "Докачано важных RPM в локальный репозиторий: $dl_done (ошибок: $dl_fail)"
+        elif (( dl_fail > 0 )); then
+            info "Важные пакеты не докачаны ($dl_fail) — при импорте будут искаться в сети или через epm play."
+        fi
     fi
 
     log "Скопировано RPM: $copied, ошибок: $failed"
