@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.6-console"
+SCRIPT_VERSION="2.0.7-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -105,7 +105,7 @@ for _pre_arg in "$@"; do
         -h|--help)
             printf 'ALT Linux Universal Sync v%s\n' "$SCRIPT_VERSION"
             printf 'Интерактив:  %s\n' "$SELF"
-            printf 'CLI:         %s <export|export-offline|import|import-offline|cryptopro|verify|fetch-deps|desktop-shortcut> [-y|--yes | --defaults] [--user NAME] [--backup-dir DIR]\n' "$SELF"
+            printf 'CLI:         %s <export|export-offline|import|import-offline|cryptopro|install-components|verify|fetch-deps|desktop-shortcut> [-y|--yes | --defaults] [--user NAME] [--backup-dir DIR]\n' "$SELF"
             printf 'Env:         ALT_SYNC_NONINTERACTIVE=1, ALT_SYNC_TARGET_USER=name, ALT_SYNC_BACKUP_DIR=DIR, NO_COLOR=1\n'
             printf 'Логи:        рядом со скриптом (%s); при недоступности — ./logs, затем /tmp\n' "$(dirname "$SELF")"
             printf '(Полная справка — в интерактивном/CLI-режиме от root.)\n'
@@ -137,6 +137,34 @@ OPT_SKIP_MOZILLA=1
 OPT_FORCE_EPM_PLAY=0
 OPT_FORCE_CRYPTO_INSTALLER=0
 OPT_ALLOW_NODEPS=0
+
+# v2.0.7: режим «умной» установки — по умолчанию пропускаем уже установленные
+# пакеты (той же или более новой версии) и ставим только недостающие/обновляемые.
+# Отключается флагом --force-reinstall или ALT_SYNC_FORCE_REINSTALL=1.
+OPT_SKIP_INSTALLED=1
+if [[ "${ALT_SYNC_FORCE_REINSTALL:-0}" == "1" ]]; then
+    OPT_SKIP_INSTALLED=0
+fi
+
+declare -A INSTALLED_VER_MAP=()
+
+# Кэш результатов rpm_ver_ge для групповой установки (одна и та же пара
+# версий встречается многократно при импорте больших списков).
+declare -A VER_GE_CACHE=()
+
+rpm_ver_ge_cached() {
+    local key="$1|$2" r
+    if [[ -n "${VER_GE_CACHE[$key]+x}" ]]; then
+        [[ "${VER_GE_CACHE[$key]}" == "1" ]] && return 0 || return 1
+    fi
+    if rpm_ver_ge "$1" "$2"; then
+        r=0
+    else
+        r=1
+    fi
+    VER_GE_CACHE["$key"]=$r
+    (( r == 0 ))
+}
 
 OPT_SKIP_VENDOR_ASSETS=0
 OPT_SKIP_VENDOR_RESTORE=0
@@ -1468,13 +1496,34 @@ install_rpm_file() {
         return 1
     fi
 
+    # v2.0.7: в режиме «только недостающее» уже установленный RPM той же или
+    # более новой версии не переустанавливается (экономия времени).
+    if (( OPT_SKIP_INSTALLED == 1 )) && have_cmd rpm; then
+        local rn rv rr inst
+        IFS='|' read -r rn rv rr < <(
+            rpm -qp --qf '%{NAME}|%{VERSION}|%{RELEASE}\n' "$rpm_file" 2>/dev/null
+        ) || true
+        if [[ -n "$rn" && -n "$rv" ]]; then
+            inst="$(rpm -q --qf '%{VERSION}|%{RELEASE}\n' "$rn" 2>/dev/null | head -1)"
+            if [[ -n "$inst" ]] && rpm_ver_ge_cached "${inst%|*}-${inst#*|}" "$rv-${rr:-0}"; then
+                log "Пропуск уже установленного RPM (версия не ниже): $rpm_file"
+                return 0
+            fi
+        fi
+    fi
+
     log "Установка RPM-файла: $rpm_file"
 
     if apt_install_pkg "$rpm_file"; then
         return 0
     fi
 
-    if rpm -Uvh --replacepkgs --oldpackage "$rpm_file" </dev/null >>"$LOG_FILE" 2>&1; then
+    if (( OPT_SKIP_INSTALLED == 1 )); then
+        # без --replacepkgs: rpm сам пропустит идентичные установленные пакеты
+        if rpm -Uvh --oldpackage "$rpm_file" </dev/null >>"$LOG_FILE" 2>&1; then
+            return 0
+        fi
+    elif rpm -Uvh --replacepkgs --oldpackage "$rpm_file" </dev/null >>"$LOG_FILE" 2>&1; then
         return 0
     fi
 
@@ -1506,11 +1555,41 @@ install_rpm_files_group() {
 
     log "Групповая установка RPM: ${#files[@]} позиц. (файлов: ${#rpm_paths[@]}, спецификаций: ${#spec_names[@]})"
 
+    # v2.0.7: в режиме «только недостающее» из группы выкидываем RPM, которые
+    # уже установлены в версии не ниже — rpm вызывается лишь для того, что
+    # реально отсутствует или устарело. Используется один снимок rpm -qa
+    # (load_installed_versions_map) вместо rpm -q на каждый файл.
+    if (( OPT_SKIP_INSTALLED == 1 )) && (( ${#rpm_paths[@]} > 0 )) && have_cmd rpm; then
+        load_installed_versions_map
+        local -a todo_paths=()
+        local rp rn rv rr inst
+        for rp in "${rpm_paths[@]}"; do
+            IFS='|' read -r rn rv rr < <(
+                rpm -qp --qf '%{NAME}|%{VERSION}|%{RELEASE}\n' "$rp" 2>/dev/null
+            ) || true
+            if [[ -n "$rn" && -n "$rv" ]] && [[ -n "${INSTALLED_VER_MAP[$rn]:-}" ]]; then
+                inst="${INSTALLED_VER_MAP[$rn]}"
+                if rpm_ver_ge_cached "${inst%|*}-${inst#*|}" "$rv-${rr:-0}"; then
+                    continue
+                fi
+            fi
+            todo_paths+=("$rp")
+        done
+        if (( ${#todo_paths[@]} < ${#rpm_paths[@]} )); then
+            log "Группа RPM: пропущено уже установленных $(( ${#rpm_paths[@]} - ${#todo_paths[@]} )) из ${#rpm_paths[@]}"
+        fi
+        rpm_paths=("${todo_paths[@]+"${todo_paths[@]}"}")
+    fi
+
     if (( ${#rpm_paths[@]} > 0 )); then
         if apt_install_pkg "${rpm_paths[@]}"; then
             return 0
         fi
-        if rpm -Uvh --replacepkgs --oldpackage "${rpm_paths[@]}" </dev/null >>"$LOG_FILE" 2>&1; then
+        if (( OPT_SKIP_INSTALLED == 1 )); then
+            if rpm -Uvh --oldpackage "${rpm_paths[@]}" </dev/null >>"$LOG_FILE" 2>&1; then
+                return 0
+            fi
+        elif rpm -Uvh --replacepkgs --oldpackage "${rpm_paths[@]}" </dev/null >>"$LOG_FILE" 2>&1; then
             return 0
         fi
         if (( OPT_ALLOW_NODEPS == 1 )); then
@@ -1575,6 +1654,26 @@ install_spec() {
         return 0
     fi
 
+    # v2.0.7: «умный» режим — если стоит та же или более новая ВЕРСИЯ пакета,
+    # не переустанавливаем точный NVRA эталона (экономия времени при повторном
+    # импорте). При --force-reinstall поведение прежнее: ставим точно эталонную
+    # сборку (rpm принимает даунгрейд через --oldpackage).
+    if (( OPT_SKIP_INSTALLED == 1 )) && have_cmd rpm; then
+        local sname="${nvra%-*}"   # убираем .arch
+        sname="${sname%-*}"        # убираем -release → остаётся name-version
+        local svrs="${nvra#"$sname"-}"
+        local inst
+        inst="${INSTALLED_VER_MAP[$sname]:-}"
+        if [[ -z "$inst" ]]; then
+            load_installed_versions_map
+            inst="${INSTALLED_VER_MAP[$sname]:-}"
+        fi
+        if [[ -n "$inst" ]] && rpm_ver_ge_cached "${inst%|*}-${inst#*|}" "$svrs"; then
+            log "Пропуск spec (установлена версия не ниже эталонной): $spec"
+            return 0
+        fi
+    fi
+
     log "Установка по spec: $spec"
 
     if apt_install_local "$spec"; then
@@ -1600,6 +1699,66 @@ install_spec() {
     return 1
 }
 
+# ─── Режим «умной» установки (v2.0.7) ─────────────────────────────────────────
+# OPT_SKIP_INSTALLED=1 (по умолчанию): перед массовой установкой RPM из
+# packages/ уже установленные пакеты (той же или более новой версии)
+# отфильтровываются — rpm вызывается только для недостающих. Это главный
+# источник экономии времени при повторном импорте (раньше весь набор
+# прогонялся через rpm -Uvh --replacepkgs заново).
+# Отключается флагом --force-reinstall (или ALT_SYNC_FORCE_REINSTALL=1) —
+# тогда поведение прежнее (принудительная переустановка всего).
+load_installed_versions_map() {
+    INSTALLED_VER_MAP=()
+    have_cmd rpm || return 0
+    local line name ver rel
+    while IFS='|' read -r name ver rel; do
+        [[ -z "$name" ]] && continue
+        # многостраничные пакеты: оставляем первую запись (стабильно при
+        # отсортированном выводе rpm -qa)
+        [[ -n "${INSTALLED_VER_MAP[$name]:-}" ]] && continue
+        INSTALLED_VER_MAP["$name"]="$ver|$rel"
+    done < <(rpm -qa --qf '%{NAME}|%{VERSION}|%{RELEASE}\n' 2>/dev/null | sort -u)
+}
+
+# Сравнение версий rpm: возвращает 0, если installed >= wanted.
+# При недоступности rpmdev-vercmp используется conservative fallback:
+# считаем версии равными только при точном совпадении строк.
+rpm_ver_ge() {
+    local inst="$1" want="$2" out
+    if command -v rpmdev-vercmp >/dev/null 2>&1; then
+        out="$(rpmdev-vercmp "$inst" "$want" 2>/dev/null)" || out=""
+        case "$out" in
+            *" > "*|*" = "*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    [[ "$inst" == "$want" ]]
+}
+
+filter_rpms_to_install() {
+    # stdin: NUL-список путей RPM; stdout: NUL-список тех, что реально нужно ставить
+    local f name ver rel inst
+    while IFS= read -r -d '' f; do
+        IFS='|' read -r name ver rel < <(
+            rpm -qp --qf '%{NAME}|%{VERSION}|%{RELEASE}\n' "$f" 2>/dev/null
+        ) || true
+        if [[ -z "$name" || -z "$ver" ]]; then
+            # не удалось прочитать метаданные — ставим на всякий случай
+            printf '%s\0' "$f"
+            continue
+        fi
+        inst="${INSTALLED_VER_MAP[$name]:-}"
+        if [[ -z "$inst" ]]; then
+            printf '%s\0' "$f"   # пакет вообще не установлен
+            continue
+        fi
+        if rpm_ver_ge_cached "${inst%|*}-${inst#*|}" "$ver-$rel"; then
+            continue              # стоит та же или более новая версия — пропускаем
+        fi
+        printf '%s\0' "$f"        # установлена более старая версия — обновляем
+    done
+}
+
 install_local_rpm_directory_fallback() {
     if [[ ! -d "$PACKAGES_DIR" ]]; then
         return 0
@@ -1618,13 +1777,43 @@ install_local_rpm_directory_fallback() {
         return 0
     fi
 
-    info "Пробую массово установить RPM из packages/ через rpm..."
+    local -a rpm_flags=(-Uvh --oldpackage)
+    local total_all total_todo
+    total_all="$(tr -dc '\0' < "$tmp" | wc -c)"
 
-    xargs -0 -r -n 100 rpm -Uvh --replacepkgs --oldpackage < "$tmp" </dev/null >>"$LOG_FILE" 2>&1 || true
+    if (( OPT_SKIP_INSTALLED == 1 )); then
+        load_installed_versions_map
+        local filtered
+        filtered="$(mktemp "${TMPDIR:-/tmp}/alt-sync-local-rpms-filtered.XXXXXX")" || {
+            rm -f "$tmp"; return 0
+        }
+        filter_rpms_to_install < "$tmp" > "$filtered" 2>>"$LOG_FILE" || true
+        # если фильтрация завершилась ошибкой (пусто при непустом входе) —
+        # консервативно берём исходный список
+        if [[ ! -s "$filtered" && -s "$tmp" && ${#INSTALLED_VER_MAP[@]} -gt 0 ]]; then
+            : # пусто legitimately: всё уже установлено — оставляем пустой список
+        elif [[ ! -s "$filtered" && -s "$tmp" ]]; then
+            cp -- "$tmp" "$filtered" 2>/dev/null || true
+        fi
+        mv -f -- "$filtered" "$tmp"
+        total_todo="$(tr -dc '\0' < "$tmp" | wc -c)"
+        info "Недостающих/устаревших RPM из packages/: ${total_todo:-0} из ${total_all:-0} (уже установленные пропущены)."
+    else
+        rpm_flags+=(--replacepkgs)
+        info "Принудительная переустановка всех RPM из packages/ (${total_all:-0}) (--force-reinstall)..."
+    fi
+
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        step_ok "Все локальные RPM уже установлены — переустановка не требуется"
+        return 0
+    fi
+
+    xargs -0 -r -n 100 rpm "${rpm_flags[@]}" < "$tmp" </dev/null >>"$LOG_FILE" 2>&1 || true
 
     if (( OPT_ALLOW_NODEPS == 1 )); then
         info "Повторная установка RPM с --nodeps разрешена меню."
-        xargs -0 -r -n 100 rpm -Uvh --nodeps --replacepkgs --oldpackage < "$tmp" </dev/null >>"$LOG_FILE" 2>&1 || true
+        xargs -0 -r -n 100 rpm -Uvh --nodeps --oldpackage < "$tmp" </dev/null >>"$LOG_FILE" 2>&1 || true
     fi
 
     rm -f "$tmp"
@@ -3223,7 +3412,11 @@ prepare_crypto_search_dirs() {
 
     CRYPTO_SEARCH_DIRS=()
 
-    add_crypto_search_dir "$SCRIPT_DIR/install"
+    # v2.0.7: реальный каталог install задаётся в начале файла
+    # (INSTALL_DIR="${SCRIPT_DIR}/install"). Раньше здесь был хардкод
+    # "$SCRIPT_DIR/install", из-за чего ключ --backup-dir / переменная
+    # ALT_SYNC_SCRIPT_DIR не влияли на поиск установщиков КриптоПро.
+    add_crypto_search_dir "$INSTALL_DIR"
     add_crypto_search_dir "$BACKUP_DIR/install"
 
     if [[ -f "$ASSETS_DIR/install.tar" ]]; then
@@ -3423,6 +3616,405 @@ enable_crypto_services() {
     )
 
     return 0
+}
+
+# ─── Установка компонентов из папки install/ (v2.0.7) ────────────────────────
+# Ожидаемая структура: каждая ПОДПАПКА каталога install/ — это отдельный
+# компонент, имя папки = имя компонента (например, «КРИПТО ПРО» с файлами
+# установки внутри). Пункт 5 меню выводит checklist со всеми найденными
+# компонентами; пользователь отмечает нужные, скрипт ставит только их.
+# В каждой выбранной папке последовательно обрабатываются:
+#   1) все *.rpm            — через умную групповую установку (пропуск уже
+#                             установленных той же/более новой версии);
+#   2) установочные скрипты (*.sh, *.run) с известными именами
+#      (install_gui.sh, setup.sh, install.sh, run_install.sh и т.п.) —
+#     запускаются от root из своего каталога;
+#   3) архивы КриптоПро-формата (linux-amd64.tgz/.tar.gz) — распаковываются
+#      во временный каталог, там ищется install_gui.sh и RPM.
+COMPONENT_ROOTS=()
+
+collect_component_roots() {
+    COMPONENT_ROOTS=()
+
+    # приоритет: live-каталог рядом со скриптом, затем копия в бэкапе,
+    # затем распакованный assets/install.tar
+    add_crypto_search_dir "$INSTALL_DIR"
+    add_crypto_search_dir "$BACKUP_DIR/install"
+
+    if [[ -f "$ASSETS_DIR/install.tar" ]]; then
+        local tmp
+        tmp="$(mktemp -d "${TMPDIR:-/tmp}/alt-sync-install-comp.XXXXXX")" || true
+        if [[ -n "$tmp" ]]; then
+            add_cleanup_tmpdir "$tmp"
+            tar_extract_safe "$ASSETS_DIR/install.tar" "$tmp" || true
+            add_crypto_search_dir "$tmp/install"
+            add_crypto_search_dir "$tmp"
+        fi
+    fi
+
+    local d sub c exists
+    for d in ${CRYPTO_SEARCH_DIRS[@]+"${CRYPTO_SEARCH_DIRS[@]}"}; do
+        [[ -d "$d" ]] || continue
+        while IFS= read -r -d '' sub; do
+            exists=0
+            for c in ${COMPONENT_ROOTS[@]+"${COMPONENT_ROOTS[@]}"}; do
+                [[ "$c" == "$sub" ]] && { exists=1; break; }
+            done
+            (( exists )) || COMPONENT_ROOTS+=("$sub")
+        done < <(find "$d" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    done
+
+    (( ${#COMPONENT_ROOTS[@]} > 0 ))
+}
+
+# Быстрая проверка: содержит ли папка что-нибудь устанавливаемое?
+component_dir_has_payload() {
+    local dir="$1"
+    find "$dir" -maxdepth 2 \( -type f -iname '*.rpm' \
+        -o -type f -name 'install*.sh' -o -type f -name 'setup*.sh' \
+        -o -type f -name 'run_install*' -o -type f -iname '*.run' \
+        -o -type f -name 'linux-amd64.t*gz' \) -print -quit 2>/dev/null | grep -q .
+}
+
+# Автоопределение «установленности» компонента для галки пропуска.
+component_already_present() {
+    local dir="$1" name="${2:-}"
+    local lower_lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+
+    # КриптоПро: если пакеты cprocsp уже стоят — компонент присутствует
+    if [[ "$lower_lc" == *"крипто"* || "$lower_lc" == *"crypto"* || "$lower_lc" == *"cprocsp"* ]]; then
+        if rpm -qa --qf '%{NAME}\n' 2>/dev/null | grep -qiE 'cprocsp|cryptopro'; then
+            return 0
+        fi
+    fi
+
+    # Pantum
+    if [[ "$lower_lc" == *pantum* ]]; then
+        [[ -d /opt/pantum || -d /usr/lib/pantum || -d /usr/share/pantum ]] && return 0
+    fi
+
+    # Epson
+    if [[ "$lower_lc" == *epson* ]]; then
+        rpm -qa 2>/dev/null | grep -qi 'iscan' && return 0
+    fi
+
+    # По всем RPM внутри папки: если каждый уже установлен (не ниже версии) —
+    # считаем компонент установленным.
+    local any_rpm=0 all_installed=1 rp rn rv rr inst
+    while IFS= read -r -d '' rp; do
+        any_rpm=1
+        IFS='|' read -r rn rv rr < <(
+            rpm -qp --qf '%{NAME}|%{VERSION}|%{RELEASE}\n' "$rp" 2>/dev/null
+        ) || true
+        [[ -z "$rn" || -z "$rv" ]] && { all_installed=0; continue; }
+        load_installed_versions_map
+        inst="${INSTALLED_VER_MAP[$rn]:-}"
+        [[ -z "$inst" ]] && { all_installed=0; continue; }
+        rpm_ver_ge_cached "${inst%|*}-${inst#*|}" "$rv-${rr:-0}" || all_installed=0
+    done < <(find "$dir" -maxdepth 2 -type f -iname '*.rpm' -print0 2>/dev/null)
+
+    if (( any_rpm == 1 && all_installed == 1 )); then
+        return 0
+    fi
+
+    return 1
+}
+
+# Выбор компонентов: диалог whiptail/dialog --checklist, fallback — нумерованный
+# консольный список. Аргументы: имена и пути (массивы COMP_NAMES / COMP_DIRS).
+SELECTED_INDICES=()
+choose_components_ui() {
+    SELECTED_INDICES=()
+
+    local n=${#COMP_NAMES[@]}
+    (( n == 0 )) && return 1
+
+    # неинтерактив: ALT_SYNC_COMPONENTS — список имён через запятую; пусто = все
+    if [[ "$NONINTERACTIVE" == "1" || "$INTERACTIVE" != "1" ]]; then
+        local want="${ALT_SYNC_COMPONENTS:-}"
+        if [[ -z "$want" ]]; then
+            local i
+            for (( i = 0; i < n; i++ )); do SELECTED_INDICES+=("$i"); done
+            log "ASK(auto): выбор всех компонентов (${n})"
+            return 0
+        fi
+        local IFS=','
+        local w i found
+        for w in $want; do
+            w="${w//[[:space:]]/}"
+            [[ -z "$w" ]] && continue
+            found=0
+            for (( i = 0; i < n; i++ )); do
+                if [[ "${COMP_NAMES[$i]}" == "$w" ]]; then
+                    SELECTED_INDICES+=("$i"); found=1; break
+                fi
+            done
+            (( found )) || step_warn "Компонент «$w» не найден в install/"
+        done
+        log "CLI-выбор компонентов: '${want}' → ${#SELECTED_INDICES[@]} шт."
+        (( ${#SELECTED_INDICES[@]} > 0 ))
+        return $?
+    fi
+
+    if have_cmd whiptail || have_cmd dialog; then
+        local prog item
+        prog="$(have_cmd whiptail && echo whiptail || echo dialog)"
+        local -a args=(--title "Установка из install/ — выберите компоненты" \
+                       --checklist "Отметьте компоненты для установки:" 20 70 "$n")
+        local i status_tag
+        for (( i = 0; i < n; i++ )); do
+            if component_already_present "${COMP_DIRS[$i]}" "${COMP_NAMES[$i]}"; then
+                status_tag="[уже есть]"
+            else
+                status_tag="[новый]"
+            fi
+            args+=("$((i + 1))" "${COMP_NAMES[$i]} ${status_tag}" off)
+        done
+        local out rc=0
+        out="$("$prog" "${args[@]}" 3>&1 1>&2 2>&3)" || rc=$?
+        if (( rc != 0 )); then
+            log "Выбор компонентов отменён пользователем (rc=$rc)"
+            return 1
+        fi
+        local idx
+        for idx in $out; do
+            idx="${idx//\"/}"
+            [[ "$idx" =~ ^[0-9]+$ ]] && SELECTED_INDICES+=("$((idx - 1))")
+        done
+        (( ${#SELECTED_INDICES[@]} > 0 ))
+        return $?
+    fi
+
+    # ── Fallback: текстовое меню (как остальной интерфейс скрипта) ──
+    printf '%b\n' "${BOLD}  Компоненты в папке install/:${NC}"
+    local i
+    for (( i = 0; i < n; i++ )); do
+        local tag=""
+        if component_already_present "${COMP_DIRS[$i]}" "${COMP_NAMES[$i]}"; then
+            tag=" ${YELLOW}[похоже, уже установлен]${NC}"
+        fi
+        printf '%b\n' "    ${GREEN}$((i + 1)))${NC} ${BOLD}${COMP_NAMES[$i]}${NC}${tag}"
+    done
+    printf '%b\n' "    ${CYAN}a${NC}) Все компоненты    ${RED}0${NC}) Отмена"
+    printf '  Отметьте компоненты через запятую (например: 1,3): '
+    if ! read_user_input ""; then
+        echo
+        return 1
+    fi
+    local ans="$REPLY_OUT"
+    ans="$(printf '%s' "$ans" | tr -d '[:space:]')"
+    if [[ -z "$ans" || "$ans" == "0" ]]; then
+        return 1
+    fi
+    if [[ "$ans" == "a" || "$ans" == "ALL" || "$ans" == "все" ]]; then
+        for (( i = 0; i < n; i++ )); do SELECTED_INDICES+=("$i"); done
+        return 0
+    fi
+    local tok num
+    local IFS=','
+    for tok in $ans; do
+        num="${tok//[!0-9]/}"
+        [[ -z "$num" ]] && continue
+        if (( num >= 1 && num <= n )); then
+            SELECTED_INDICES+=("$((num - 1))")
+        else
+            step_warn "Неверный номер компонента: $tok"
+        fi
+    done
+    unset IFS
+    (( ${#SELECTED_INDICES[@]} > 0 ))
+}
+
+# Установка одного компонента из корня его папки. Возвращает 0, если было
+# установлено что-либо (или компонент уже присутствовал), 1 — если ничего
+# найти не удалось.
+install_component_from_dir() {
+    local root="$1" name="$2"
+    local did_something=0
+
+    info "Компонент «$name»: сканирую $root"
+
+    # 1) RPM компонента — группой (умный режим сам отфильтрует установленное)
+    local -a comp_rpms=()
+    local rf
+    while IFS= read -r -d '' rf; do
+        comp_rpms+=("$rf")
+    done < <(find "$root" -maxdepth 3 -type f -iname '*.rpm' -print0 2>/dev/null | sort -z)
+
+    if (( ${#comp_rpms[@]} > 0 )); then
+        if install_rpm_files_group "${comp_rpms[@]}"; then
+            info "Компонент «$name»: RPM обработаны (${#comp_rpms[@]} шт.)"
+            did_something=1
+        else
+            step_warn "Компонент «$name»: часть RPM не установилась"
+            did_something=1
+        fi
+    fi
+
+    # 2) Архивы формата CryptoPro (linux-amd64.tgz/.tar.gz) → install_gui.sh/RPM
+    local archive extract_dir gf
+    while IFS= read -r -d '' archive; do
+        extract_dir="$(mktemp -d "${TMPDIR:-/tmp}/alt-sync-comp-extract.XXXXXX")" || continue
+        add_cleanup_tmpdir "$extract_dir"
+        if extract_archive_to_dir "$archive" "$extract_dir"; then
+            local -a extra_rpms=()
+            while IFS= read -r -d '' gf; do
+                extra_rpms+=("$gf")
+            done < <(find "$extract_dir" -type f -iname '*.rpm' -print0 2>/dev/null | sort -z)
+            if (( ${#extra_rpms[@]} > 0 )); then
+                install_rpm_files_group "${extra_rpms[@]}" && did_something=1
+            fi
+            local gui
+            gui="$(find "$extract_dir" -maxdepth 4 -type f -name install_gui.sh -print -quit 2>/dev/null || true)"
+            if [[ -n "$gui" ]]; then
+                if run_component_script "$(dirname "$gui")" "install_gui.sh" "$name"; then
+                    did_something=1
+                fi
+            fi
+        fi
+    done < <(find "$root" -maxdepth 3 -type f \( -name 'linux-amd64.tgz' -o -name 'linux-amd64.tar.gz' \) -print0 2>/dev/null)
+
+    # 3) Установочные скрипты в самой папке компонента
+    local sf sf_base
+    while IFS= read -r -d '' sf; do
+        sf_base="$(basename "$sf")"
+        case "$sf_base" in
+            uninstall*|*remove*)
+                continue ;;
+        esac
+        if run_component_script "$(dirname "$sf")" "$sf_base" "$name"; then
+            did_something=1
+        fi
+    done < <(
+        find "$root" -maxdepth 2 -type f \
+            \( -name 'install*.sh' -o -name 'setup*.sh' -o -name 'run_install*' -o -iname '*.run' \) \
+            -print0 2>/dev/null | sort -z
+    )
+
+    if (( did_something == 0 )); then
+        step_warn "Компонент «$name»: в папке не найдено ни RPM, ни установочных скриптов — пропущен."
+        return 1
+    fi
+
+    return 0
+}
+
+run_component_script() {
+    local dir="$1" script_name="$2" comp="$3"
+    local spath="$dir/$script_name"
+
+    [[ -f "$spath" ]] || return 1
+
+    # повторный запуск того же скрипта в рамках одной сессии не нужен
+    [[ -n "${RUN_COMPONENT_SCRIPTS_DONE[$spath]+x}" ]] && return 0
+
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        info "Нет TTY — интерактивный установщик «$script_name» ($comp) не запускаю. Вручную: cd $(printf '%q' "$dir") && bash ./$(printf '%q' "$script_name")"
+        RUN_COMPONENT_SCRIPTS_DONE["$spath"]=1
+        return 0
+    fi
+
+    info "Запускаю установщик компонента «$comp»: $spath"
+    log "RUN component installer: $spath (cwd=$dir)"
+    RUN_COMPONENT_SCRIPTS_DONE["$spath"]=1
+
+    if (
+        cd "$dir" || exit 1
+        if [[ -x "$spath" ]]; then
+            "$spath"
+        else
+            bash "$spath"
+        fi
+    ); then
+        return 0
+    fi
+
+    step_warn "Установщик $script_name ($comp) завершился с ошибкой или прерван."
+    return 1
+}
+
+declare -A RUN_COMPONENT_SCRIPTS_DONE=()
+
+# Есть ли в install/ подпапки-компоненты с устанавливаемым содержимым?
+# Используется пунктом 5 меню для выбора между checklist-режимом и прежней
+# узкой логикой CryptoPro.
+components_available() {
+    prepare_crypto_search_dirs
+    collect_component_roots || return 1
+
+    local r
+    for r in "${COMPONENT_ROOTS[@]}"; do
+        if component_dir_has_payload "$r"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+do_install_from_folder() {
+    require_pkg_tools
+    ensure_rpm_index
+
+    prepare_crypto_search_dirs
+
+    if ! collect_component_roots; then
+        step_warn "В папке install/ нет подпапок-компонентов."
+        printf '%b\n' "${CYAN}  ℹ️  Ожидается структура: install/<Имя компонента>/файлы установки (например, install/КРИПТО ПРО/...)${NC}"
+        write_summary_report "Установка из install/ (компоненты не найдены)"
+        return 1
+    fi
+
+    # Собираем уникальные имена компонентов (одинаковые имена из разных roots
+    # сливаются — приоритет у первого добавленного root)
+    COMP_NAMES=()
+    COMP_DIRS=()
+    declare -A seen_names=()
+    local r base
+    for r in "${COMPONENT_ROOTS[@]}"; do
+        base="$(basename "$r")"
+        [[ -z "${seen_names[$base]:-}" ]] || continue
+        if ! component_dir_has_payload "$r"; then
+            continue
+        fi
+        seen_names["$base"]=1
+        COMP_NAMES+=("$base")
+        COMP_DIRS+=("$r")
+    done
+
+    if (( ${#COMP_NAMES[@]} == 0 )); then
+        step_warn "Ни одна подпапка install/ не содержит устанавливаемых файлов (*.rpm / install*.sh / *.run / linux-amd64.tgz)."
+        write_summary_report "Установка из install/ (пустые компоненты)"
+        return 1
+    fi
+
+    if ! choose_components_ui; then
+        info "Установка из install/ отменена."
+        return 1
+    fi
+
+    init_steps "$(( ${#SELECTED_INDICES[@]} + 1 ))"
+    step_start "Подготовка локального репозитория"
+    if [[ -d "$PACKAGES_DIR" ]]; then
+        prepare_local_apt
+        apt_update_local || true
+    fi
+    step_ok "Локальный репозиторий готов"
+
+    local idx ok=0 fail=0
+    for idx in "${SELECTED_INDICES[@]}"; do
+        step_start "Компонент: ${COMP_NAMES[$idx]}"
+        if install_component_from_dir "${COMP_DIRS[$idx]}" "${COMP_NAMES[$idx]}"; then
+            step_ok "Компонент «${COMP_NAMES[$idx]}» обработан"
+            ok=$((ok + 1))
+        else
+            step_warn "Компонент «${COMP_NAMES[$idx]}» не установлен"
+            fail=$((fail + 1))
+        fi
+    done
+
+    info "Итог: успешно $ok, с предупреждениями/ошибками $fail."
+    write_summary_report "Установка из install/: выбрано ${#SELECTED_INDICES[@]}, готово $ok, проблем $fail"
+    (( fail == 0 ))
 }
 
 install_cryptopro() {
@@ -3708,6 +4300,16 @@ do_cryptopro_only() {
     restore_assets
     step_ok "Ассеты обработаны"
 
+    # v2.0.7: если в install/ есть подпапки-компоненты (имя папки = имя
+    # компонента, например «КРИПТО ПРО»), показываем checklist и ставим
+    # только выбранное. Если компонентов нет — прежняя логика CryptoPro.
+    if components_available; then
+        do_install_from_folder
+        return $?
+    fi
+
+    info "Подпапок-компонентов в install/ не найдено — работаю по прежней схеме (только CryptoPro)."
+
     step_start "Локальный репозиторий, если он есть"
     ensure_rpm_index
 
@@ -3988,6 +4590,15 @@ prepare_import_interactive() {
         OPT_ALLOW_NODEPS=0
     fi
 
+    # v2.0.7: режим «умной» установки по умолчанию включён; предлагаем
+    # принудительную переустановку всего набора (прежнее поведение).
+    if ask_yes_no "Принудительно переустанавливать ВСЕ пакеты эталона (медленнее)? Пустая строка = только недостающие/обновляемые" n; then
+        OPT_SKIP_INSTALLED=0
+    else
+        OPT_SKIP_INSTALLED=1
+    fi
+    VER_GE_CACHE=()
+
     return 0
 }
 
@@ -4080,7 +4691,7 @@ show_menu() {
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}2${NC}) Экспорт эталона: только локальные RPM                  ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${YELLOW}3${NC}) Импорт на копию железа: интерактивный                  ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${YELLOW}4${NC}) Импорт на копию железа: полностью офлайн               ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${BLUE}5${NC}) Только CryptoPro + доп. RPM                            ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${BLUE}5${NC}) Установка из install/ (выбор компонентов; CryptoPro)   ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${CYAN}6${NC}) Проверить бэкап (целостность)                          ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}7${NC}) Скачать компоненты в офлайн-кэш (нужен интернет)       ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${MAGENTA}8${NC}) Сводка системы и текущих настроек                      ${BOLD}${CYAN}║${NC}"
@@ -4342,7 +4953,12 @@ CLI-режим (для автоматизации; без аргументов �
   export-offline    Экспорт эталона только из локальных RPM (аналог меню 2)
   import            Интерактивный импорт на копию железа (аналог меню 3)
   import-offline    Полностью офлайн-импорт (аналог меню 4)
-  cryptopro         Только CryptoPro + доп. RPM (аналог меню 5)
+  cryptopro         Только CryptoPro + доп. RPM (аналог меню 5; если в
+                    install/ есть подпапки-компоненты — покажет их выбор)
+  install-components Выбор компонентов из подпапок install/ (checklist):
+                    имя папки = имя компонента (например, «КРИПТО ПРО»);
+                    устанавливаются RPM/install*.sh/*.run только из
+                    ОТМЕЧЕННЫХ папок; уже установленное пропускается.
   verify            Проверка бэкапа (аналог меню 6)
   fetch-deps        [ЭТАЛОН, нужен интернет] Скачать все зависимости скрипта
                     в офлайн-кэш deps-rpm/ рядом со скриптом — для установки
@@ -4360,6 +4976,11 @@ CLI-режим (для автоматизации; без аргументов �
       --without-mozilla      Не включать ~/.mozilla (по умолчанию)
       --user NAME            Пользователь, чей профиль бэкапится/восстанавливается
       --backup-dir DIR       Каталог бэкапа (по умолчанию рядом со скриптом)
+      --force-reinstall      Принудительно переустанавливать ВСЕ пакеты
+                             (прежнее поведение; по умолчанию скрипт ставит
+                             только недостающие/обновляемые — быстрее)
+      --skip-installed       Явно включить режим «только недостающее»
+                             (по умолчанию включён)
       --no-color             Отключить цветной вывод
   -h, --help        Эта справка
   -V, --version     Версия
@@ -4375,6 +4996,9 @@ CLI-режим (для автоматизации; без аргументов �
   ALT_SYNC_NO_AUTOINSTALL=1       Отключить автоустановку зависимостей
   ALT_SYNC_DEPS_CACHE_DIR=DIR     Каталог офлайн-кэша зависимостей
   ALT_SYNC_APT_INTERACTIVE=1      Разрешить диалоги apt (по умолчанию неинтерактивно)
+  ALT_SYNC_FORCE_REINSTALL=1      То же, что --force-reinstall
+  ALT_SYNC_COMPONENTS="a,b"       Неинтерактивный выбор компонентов install/
+                                  через запятую (пусто = все)
   NO_COLOR=1                      Отключить цветной вывод
 
 Прогресс и отмена (консольный аналог окна прогресса прежней GUI-версии):
@@ -4440,6 +5064,13 @@ main() {
             --without-mozilla)
                 OPT_SKIP_MOZILLA=1
                 ;;
+            --force-reinstall)
+                OPT_SKIP_INSTALLED=0
+                VER_GE_CACHE=()
+                ;;
+            --skip-installed)
+                OPT_SKIP_INSTALLED=1
+                ;;
             --user)
                 if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
                     ALT_SYNC_TARGET_USER="$2"
@@ -4492,7 +5123,7 @@ main() {
                 ASSETS_DIR="$BACKUP_DIR/assets"
                 MACHINE_ID_FILE="$BACKUP_DIR/.machine_id"
                 ;;
-            export|export-offline|import|import-offline|cryptopro|verify|fetch-deps|desktop-shortcut)
+            export|export-offline|import|import-offline|cryptopro|install-components|verify|fetch-deps|desktop-shortcut)
                 if [[ -n "$action" && "$action" != "$1" ]]; then
                     die "Нельзя указать два действия одновременно: '$action' и '$1'"
                 fi
@@ -4603,6 +5234,10 @@ main() {
             cryptopro)
                 prepare_crypto_interactive || rc=$?
                 (( rc == 0 )) && { do_cryptopro_only || rc=$?; }
+                ;;
+            install-components)
+                prepare_crypto_interactive || rc=$?
+                (( rc == 0 )) && { do_install_from_folder || rc=$?; }
                 ;;
             verify)
                 do_verify || rc=$?
