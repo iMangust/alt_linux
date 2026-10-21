@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.8-console"
+SCRIPT_VERSION="2.0.10-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -594,33 +594,89 @@ REQUIRED_CORE_UTILS=(find sort tar awk sed grep date getent sleep wc cut tr
                      dirname basename mkdir rm cp chmod touch cat xargs id
                      mktemp hostname uname du mv sha256sum)
 
+# Формат записи: команда|кандидаты-пакеты (первый найденный в репозиториях используется).
+# ВАЖНО (v2.0.9): имена пакетов различаются между ветками ALT (p10/p11) и другими
+# дистрибутивами, поэтому вместо одного жёсткого имени указан список кандидатов,
+# а перед установкой каждый кандидат проверяется через доступность в индексах apt
+# (см. resolve_pkg_candidate). Например: xz-utils существует только в Sisyphus,
+# в p10/p11 пакет называется xz; polkit в ALT — libpolkit или polkit-demo-utils.
 DEPENDENCY_SPECS=(
     "rpm|rpm"
-    "apt-get|apt"
-    "flock|util-linux"
+    "apt-get|apt apt"
+    "flock|util-linux util-linux-core"
     "gzip|gzip"
     "bzip2|bzip2"
-    "xz|xz-utils"
-    "zstd|zstd"
-    "timeout|coreutils"
-    "unrar|unrar"
+    "xz|xz xz-utils"
+    "zstd|zstd libzstd"
+    "timeout|coreutils timeout"
+    "unrar|unrar unrar-nonfree"
     "unar|unar"
-    "bsdtar|libarchive-tools"
-    "7z|p7zip"
-    "7za|p7zip"
+    "bsdtar|libarchive-tools libarchive bsd-tar"
+    "7z|p7zip p7zip-full"
+    "7za|p7zip p7zip-full"
     "unzip|unzip"
     "epm|epm"
-    "whiptail|dialog"
-    "pkexec|polkit"
+    "whiptail|newt whiptail libnewt"
+    "pkexec|polkit libpolkit polkit-demo-utils"
 )
 
+# Разворачивает «cmd|pkg1 pkg2 ...» в массив кандидатов
+spec_candidates() {
+    local spec="$1"
+    read -ra __CANDIDATES <<< "${spec#*|}"
+}
+
 pkg_for_cmd() {
-    local spec c p
+    local spec c
     for spec in "${DEPENDENCY_SPECS[@]}"; do
-        c="${spec%%|*}"; p="${spec#*|}"
-        [[ "$c" == "$1" ]] && { printf '%s' "$p"; return 0; }
+        c="${spec%%|*}"
+        if [[ "$c" == "$1" ]]; then
+            spec_candidates "$spec"
+            printf '%s' "${__CANDIDATES[0]}"
+            return 0
+        fi
     done
     printf '%s' "$1"
+}
+
+# Возвращает 0 и печатает имя пакета, который реально доступен для установки
+# (уже установлен ИЛИ найден хотя бы в одном включённом репозитории).
+resolve_pkg_candidate() {
+    local candidates=("$@") p
+    # уже установлен?
+    for p in "${candidates[@]}"; do
+        if have_cmd rpm && rpm -q "$p" >/dev/null 2>&1; then printf '%s' "$p"; return 0; fi
+    done
+    # есть ли такой пакет в индексах apt?
+    if have_cmd apt-cache; then
+        for p in "${candidates[@]}"; do
+            if apt-cache show "$p" >/dev/null 2>&1; then printf '%s' "$p"; return 0; fi
+        done
+    fi
+    # epm-query как резервный канал проверки
+    if have_cmd epm; then
+        for p in "${candidates[@]}"; do
+            if epm --no-prompt query "$p" >/dev/null 2>&1; then printf '%s' "$p"; return 0; fi
+        done
+    fi
+    # ничего не нашли — возвращаем первый кандидат (штатная попытка установки)
+    printf '%s' "${candidates[0]}"
+    return 1
+}
+
+# То же, но по команде: находит спековую запись и резолвит её кандидатов
+resolve_pkg_for_cmd() {
+    local want="$1" spec c
+    for spec in "${DEPENDENCY_SPECS[@]}"; do
+        c="${spec%%|*}"
+        if [[ "$c" == "$want" ]]; then
+            spec_candidates "$spec"
+            resolve_pkg_candidate "${__CANDIDATES[@]}"
+            return $?
+        fi
+    done
+    printf '%s' "$want"
+    return 1
 }
 
 require_commands() {
@@ -725,6 +781,15 @@ PANTUM_PKGS=(
     # входит в пакет «newt»/«libnewt» — некорректные имена приводили к
     # гарантированно падающей apt-get install в install_special_packages.
     libnewt
+    # Критично для «epm play pantum»: драйвер Pantum распространяется в виде
+    # .deb, и eepm конвертирует его через dpkg-deb + alien. Без этих пакетов
+    # на чистой копии epm play падает с «dpkg-deb: команда не найдена».
+    dpkg
+    alien
+    p7zip
+    wget
+    cpio
+    rpm-build
 )
 
 CRYPTO_PKGS=(
@@ -898,6 +963,10 @@ auto_install_dependencies() {
     done
     info "Не хватает зависимостей (${#uniq[@]}): ${uniq[*]}. Пробую установить автоматически..."
     set +e
+    # ВАЖНО (v2.0.9): обновляем индексы репозиториев ДО резолвинга кандидатов.
+    # Без этого apt-cache работает по устаревшему локальному кэшу списков и
+    # ложно сообщает «пакет не найден в репозиториях» при первом запуске.
+    refresh_repo_indexes_once
     local -a still_missing=()
     if deps_cache_available; then
         info "Пробую установить недостающие зависимости из офлайн-кэша: $DEPS_CACHE_DIR"
@@ -909,27 +978,75 @@ auto_install_dependencies() {
         still_missing=("${uniq[@]}")
     fi
     if ((${#still_missing[@]} > 0)); then
-        refresh_repo_indexes_once
-        local ok=0 fail=0
+        local ok=0 fail=0 resolved rc
+        local -a skipped=()
         for p in "${still_missing[@]}"; do
-            if install_pkg_by_name "$p"; then
-                ok=$((ok+1)); log "INFO: установлен пакет $p."
+            # Резолвим имя пакета среди кандидатов спеки: берём тот, который
+            # реально есть в rpm/apt-cache/epm. Если ни один кандидат не найден —
+            # пропускаем с понятным сообщением вместо бесконечных неудачных попыток.
+            resolved="$(resolve_pkg_candidate_by_pkgname "$p")"; rc=$?
+            if (( rc != 0 )); then
+                warn "Пакет '$p' не найден ни в одном включённом репозитории (проверены кандидаты: $(candidates_for_pkgname "$p")). Пропускаю — будет использован fallback."
+                skipped+=("$p")
+                continue
+            fi
+            if install_pkg_by_name "$resolved"; then
+                ok=$((ok+1)); log "INFO: установлен пакет $resolved."
             else
-                fail=$((fail+1)); warn "Не удалось установить пакет: $p"
+                fail=$((fail+1)); warn "Не удалось установить пакет: $resolved"
             fi
         done
+        ((${#skipped[@]} > 0)) && log "INFO: пропущены недоступные зависимости: ${skipped[*]} (скрипт продолжит работу через fallback-механизмы)."
         log "INFO: автоустановка зависимостей из сети: успех=$ok, ошибок=$fail."
     fi
     set -e
 }
 
-pkg_for_cmd_reverse() {
+# Возвращает список всех команд, для которых указан пакет $1
+pkg_to_cmds() {
     local want="$1" spec c p
     for spec in "${DEPENDENCY_SPECS[@]}"; do
         c="${spec%%|*}"; p="${spec#*|}"
-        [[ "$p" == "$want" ]] && { printf '%s' "$c"; return 0; }
+        [[ " $p " == *" $want "* ]] && printf '%s\n' "$c"
     done
-    printf '%s' "$want"
+}
+
+pkg_for_cmd_reverse() {
+    local cmds
+    cmds="$(pkg_to_cmds "$1")"
+    if [[ -n "$cmds" ]]; then printf '%s' "$(printf '%s\n' "$cmds" | head -1)"; else printf '%s' "$1"; fi
+}
+
+# Подбирает доступный кандидат-пакет по имени из спеки (возвращает первое
+# доступное имя среди всех кандидатов всех спек, где встречается это имя,
+# либо само имя, если оно доступно напрямую)
+resolve_pkg_candidate_by_pkgname() {
+    local want="$1" spec c p cand found rc=1
+    # собираем уникальных кандидатов из всех спек, содержащих want
+    local -A seen=(); local -a cands=()
+    for spec in "${DEPENDENCY_SPECS[@]}"; do
+        p="${spec#*|}"
+        [[ " $p " == *" $want "* ]] || continue
+        read -ra _cs <<< "$p"
+        for cand in "${_cs[@]}"; do
+            [[ -n "${seen[$cand]:-}" ]] && continue
+            seen["$cand"]=1; cands+=("$cand")
+        done
+    done
+    ((${#cands[@]} == 0)) && cands=("$want")
+    found="$(resolve_pkg_candidate "${cands[@]}")"; rc=$?
+    printf '%s' "$found"
+    return "$rc"
+}
+
+candidates_for_pkgname() {
+    local want="$1" spec p out=""
+    for spec in "${DEPENDENCY_SPECS[@]}"; do
+        p="${spec#*|}"
+        [[ " $p " == *" $want "* ]] && out+=" $p"
+    done
+    [[ -z "$out" ]] && out=" $want"
+    printf '%s' "${out# }"
 }
 
 cleanup_local_apt() {
@@ -1012,6 +1129,11 @@ install_pkgs_from_offline_cache() {
 
     local p c still_missing=()
     for p in "${pkgs[@]}"; do
+        # v2.0.9: в кэше может лежать пакет-кандидат под другим именем (xz вместо
+        # xz-utils и т.п.) — собираем полный список кандидатов для проверки.
+        local -a pcands=("$p")
+        read -ra _tmpc <<< "$(candidates_for_pkgname "$p")" 2>/dev/null || true
+        for _tc in "${_tmpc[@]}"; do [[ " ${pcands[*]} " == *" $_tc "* ]] || pcands+=("$_tc"); done
         if (( APT_LOCAL_ENABLED == 1 )) && apt_install_local "$p"; then
             log "INFO: пакет $p установлен из офлайн-кэша ($DEPS_CACHE_DIR)."
             continue
@@ -1029,9 +1151,21 @@ install_pkgs_from_offline_cache() {
                 done
             fi
         fi
+        # Проверка «получен ли пакет»: команда доступна ИЛИ файл любого кандидата
+        # лежит в кэше (для последующей сетевой доводки зависимостей).
         c="$(pkg_for_cmd_reverse "$p")"
         if have_cmd "$c"; then
             log "INFO: пакет $p получен из офлайн-кэша."
+            continue
+        fi
+        local _pc _found_in_cache=0
+        for _pc in "${pcands[@]}"; do
+            if find "$DEPS_CACHE_DIR" -maxdepth 1 -type f \( -iname "${_pc}-*.rpm" -o -iname "${_pc}_*.deb" \) -print -quit 2>/dev/null | grep -q .; then
+                _found_in_cache=1; break
+            fi
+        done
+        if (( _found_in_cache == 1 )); then
+            log "INFO: пакет $p (или кандидат из $_pc) присутствует в офлайн-кэше."
             continue
         fi
         still_missing+=("$p")
@@ -1055,7 +1189,11 @@ fetch_deps_cache() {
     OPT_NETWORK_ENABLED=1
     refresh_repo_indexes_once
 
-    local -A seen=(); local -a pkgs=() spec c p
+    # ВАЖНО (v2.0.9): для каждой зависимости перебираем ВСЕ кандидаты из спеки и
+    # скачиваем первого доступного в репозиториях. Раньше использовалось одно
+    # жёсткое имя (например, xz-utils/polkit/dialog), которого нет в p10/p11 ALT,
+    # и пакет ложно помечался как «недоступен в репозиториях».
+    local -A seen=(); local -a pkgs=() resolved_pkgs=() spec c p rc
     for spec in "${DEPENDENCY_SPECS[@]}"; do
         c="${spec%%|*}"; p="${spec#*|}"
         [[ -n "${seen[$p]:-}" ]] && continue
@@ -1063,6 +1201,24 @@ fetch_deps_cache() {
     done
 
     local tmp total=${#pkgs[@]} done_n=0 failed=() notavail=()
+    # Резолвим кандидатов ДО проверки доступности
+    for ((i = 0; i < total; i++)); do
+        resolved="$(resolve_pkg_candidate_by_pkgname "${pkgs[$i]}")"; rc=$?
+        if (( rc == 0 )); then
+            resolved_pkgs+=("$resolved")
+        else
+            resolved_pkgs+=("${pkgs[$i]}")   # оставим — ниже будет отфильтрован
+        fi
+    done
+    pkgs=("${resolved_pkgs[@]}")
+    # уникализация (несколько команд могут резолвиться в один пакет)
+    local -A useen=(); local -a upkgs=()
+    for p in "${pkgs[@]}"; do
+        [[ -n "${useen[$p]:-}" ]] && continue
+        useen["$p"]=1; upkgs+=("$p")
+    done
+    pkgs=("${upkgs[@]}"); total=${#pkgs[@]}
+
     if have_cmd apt-get; then
         local _pol
         for ((i = total - 1; i >= 0; i--)); do
@@ -1083,7 +1239,7 @@ fetch_deps_cache() {
             fi
         done
     fi
-    ((${#notavail[@]} > 0)) && log "INFO: пропущены недоступные в репозиториях пакеты: ${notavail[*]}"
+    ((${#notavail[@]} > 0)) && log "INFO: пропущены недоступные в репозиториях пакеты (все кандидаты исчерпаны): ${notavail[*]}"
     total=${#pkgs[@]}
     if (( total == 0 )); then
         step_warn "Все проверяемые пакеты уже установлены или недоступны — скачивать нечего."
@@ -1973,20 +2129,56 @@ copy_all_rpm_sources() {
             imp_uniq+=("$ipkg")
         done
 
-        local dl_done=0 dl_fail=0
-        for ipkg in "${imp_uniq[@]}"; do
-            # уже есть локально?
-            if find "$PACKAGES_DIR" -maxdepth 1 -type f -iname "${ipkg}-*.rpm" 2>/dev/null | grep -q .; then
-                continue
-            fi
-            ALT_SYNC_ALLOW_NET=1; export ALT_SYNC_ALLOW_NET
-            if ( cd "$PACKAGES_DIR" && apt_with_timeout 300 "${APT_NET_OPTS[@]}" download "$ipkg" </dev/null >>"$LOG_FILE" 2>&1 ); then
-                dl_done=$((dl_done + 1))
+        local dl_done=0 dl_fail=0 _apt_ok=0
+        # ВАЖНО (v2.0.9): если apt-get download недоступен или ни один пакет не
+        # скачался им (например, нет права на запись или особенности apt в p10),
+        # включаем резервный канал — apt-get install --download-only с копированием
+        # из /var/cache/apt/archives.
+        ALT_SYNC_ALLOW_NET=1; export ALT_SYNC_ALLOW_NET
+        if (( ${#imp_uniq[@]} > 0 )); then
+            if ! have_cmd apt-get; then
+                log "INFO: apt-get отсутствует — пропускаю докачку важных RPM."
             else
-                dl_fail=$((dl_fail + 1))
-                log "INFO: важный пакет '$ipkg' недоступен для докачки (не найден в репозиториях)."
+                for ipkg in "${imp_uniq[@]}"; do
+                    # уже есть локально?
+                    if find "$PACKAGES_DIR" -maxdepth 1 -type f -iname "${ipkg}-*.rpm" 2>/dev/null | grep -q .; then
+                        continue
+                    fi
+                    if ( cd "$PACKAGES_DIR" && apt_with_timeout 300 "${APT_NET_OPTS[@]}" download "$ipkg" </dev/null >>"$LOG_FILE" 2>&1 ); then
+                        dl_done=$((dl_done + 1)); _apt_ok=1
+                    else
+                        dl_fail=$((dl_fail + 1))
+                        log "INFO: важный пакет '$ipkg' недоступен для докачки (не найден в репозиториях)."
+                    fi
+                done
+                # Резервный канал: если apt-get download целиком не сработал (_apt_ok==0)
+                # и остались несохранные пакеты — пробуем download-only через кэш apt.
+                if (( _apt_ok == 0 && dl_fail > 0 )); then
+                    info "apt-get download не сработал — пробую резервный путь: apt-get install --download-only + копирование из /var/cache/apt/archives"
+                    local -a still_need=()
+                    for ipkg in "${imp_uniq[@]}"; do
+                        find "$PACKAGES_DIR" -maxdepth 1 -type f -iname "${ipkg}-*.rpm" 2>/dev/null | grep -q . || still_need+=("$ipkg")
+                    done
+                    if (( ${#still_need[@]} > 0 )); then
+                        local archives_dir="/var/cache/apt/archives"
+                        local before_cnt after_cnt copied_fb=0
+                        before_cnt=$(find "$archives_dir" -maxdepth 1 -name '*.deb' -o -maxdepth 1 -name '*.rpm' 2>/dev/null | wc -l)
+                        if env DEBIAN_FRONTEND=noninteractive apt-get "${APT_NET_OPTS[@]}" "${APT_NO_PROMPT_OPTS[@]}" \
+                                install --download-only -y "${still_need[@]}" </dev/null >>"$LOG_FILE" 2>&1; then
+                            after_cnt=$(find "$archives_dir" -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) 2>/dev/null | wc -l)
+                            local fb_file
+                            while IFS= read -r -d '' fb_file; do
+                                safe_copy "$fb_file" "$PACKAGES_DIR" && copied_fb=$((copied_fb + 1))
+                            done < <(find "$archives_dir" -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -newermt "-5 minutes" -print0 2>/dev/null)
+                            dl_done=$((dl_done + copied_fb)); dl_fail=0
+                            log "INFO: резервная докачка: сохранено $copied_fb файлов из $archives_dir (всего стало $after_cnt против $before_cnt)."
+                        else
+                            warn "Резервная докачка через download-only тоже не удалась (см. техлог)."
+                        fi
+                    fi
+                fi
             fi
-        done
+        fi
 
         if (( dl_done > 0 )); then
             log "Докачано важных RPM в локальный репозиторий: $dl_done (ошибок: $dl_fail)"
@@ -3404,6 +3596,19 @@ install_pantum() {
         return 0
     fi
 
+    # Подготовка инструментов конвертации .deb -> .rpm: драйвер Pantum
+    # распространяется как zip с .deb внутри, и eepm распаковывает его 7z,
+    # извлекает .deb через dpkg-deb и переупаковывает alien + rpmbuild.
+    # Без этих утилит «epm play pantum» падает («dpkg-deb: команда не найдена»)
+    # или интерактивно запрашивает их установку, чего в неинтерактивном
+    # режиме скрипта быть не должно.
+    local conv_tool
+    for conv_tool in dpkg alien p7zip unrar cpio rpm-build; do
+        if ! rpm -q "$conv_tool" >/dev/null 2>&1; then
+            install_package_name "$conv_tool" || true
+        fi
+    done
+
     info "Устанавливаю Pantum через epm play pantum..."
 
     # Эталонная инструкция: «apt-get update && apt-get install epm», затем
@@ -3430,6 +3635,45 @@ install_pantum() {
     fi
 
     step_warn "Не удалось установить Pantum через epm play."
+
+    # Резервный канал: если на эталоне драйвер Pantum был скачан eepm в кэш
+    # (/var/cache/epm и т.п.), он попал в vendor-assets.tar и восстановлен на
+    # этой машине. Ищем сохранённый .rpm/.deb и ставим напрямую — это позволяет
+    # развернуть Pantum даже без доступа к pantum.ru с клиента.
+    local pb_dir="$BACKUP_DIR/vendor/restored"
+    local cached_rpm=""
+    cached_rpm=$(find "$pb_dir" /var/cache/epm /var/tmp -maxdepth 6 \
+                     \( -name 'pantum*.rpm' -o -name 'pantum*.deb' \) \
+                     -type f 2>/dev/null | sort | tail -n1)
+    if [[ -n "$cached_rpm" ]]; then
+        info "Найден сохранённый пакет Pantum: $cached_rpm — устанавливаю напрямую..."
+        case "$cached_rpm" in
+            *.rpm)
+                if install_rpm_file "$cached_rpm"; then
+                    step_ok "Pantum установлен из сохранённого RPM (резервный канал)."
+                    return 0
+                fi
+                ;;
+            *.deb)
+                if command -v alien >/dev/null 2>&1 && dpkg-deb -e "$cached_rpm" /tmp 2>/dev/null; then
+                    local tmpd
+                    tmpd=$(mktemp -d)
+                    if ( cd "$tmpd" && alien --to-rpm --scripts "$cached_rpm" ) >>"$LOG_FILE" 2>&1; then
+                        local genrpm
+                        genrpm=$(find "$tmpd" -maxdepth 1 -name 'pantum*.rpm' | head -n1)
+                        if [[ -n "$genrpm" ]] && install_rpm_file "$genrpm"; then
+                            step_ok "Pantum установлен из сохранённого DEB (конвертация alien)."
+                            rm -rf "$tmpd"
+                            return 0
+                        fi
+                    fi
+                    rm -rf "$tmpd"
+                fi
+                ;;
+        esac
+        step_warn "Сохранённый пакет Pantum не удалось установить автоматически."
+    fi
+
     step_warn "Выполните вручную от root: apt-get update && apt-get install epm && epm play pantum"
     step_warn "Затем установите принтер через «Параметры печати»."
 
