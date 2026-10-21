@@ -80,7 +80,7 @@ for _pre_arg in "$@"; do
         -h|--help)
             printf 'ALT Linux Universal Sync v%s\n' "$SCRIPT_VERSION"
             printf 'Интерактив:  %s\n' "$SELF"
-            printf 'CLI:         %s <export|export-offline|import|import-offline|cryptopro|verify|fetch-deps> [-y|--yes | --defaults] [--user NAME] [--backup-dir DIR]\n' "$SELF"
+            printf 'CLI:         %s <export|export-offline|import|import-offline|cryptopro|verify|fetch-deps|desktop-shortcut> [-y|--yes | --defaults] [--user NAME] [--backup-dir DIR]\n' "$SELF"
             printf 'Env:         ALT_SYNC_NONINTERACTIVE=1, ALT_SYNC_TARGET_USER=name, ALT_SYNC_BACKUP_DIR=DIR, NO_COLOR=1\n'
             printf 'Логи:        рядом со скриптом (%s); при недоступности — ./logs, затем /tmp\n' "$(dirname "$SELF")"
             printf '(Полная справка — в интерактивном/CLI-режиме от root.)\n'
@@ -3950,6 +3950,7 @@ show_menu() {
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${CYAN}6${NC}) Проверить бэкап (целостность)                          ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}7${NC}) Скачать компоненты в офлайн-кэш (нужен интернет)       ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${MAGENTA}8${NC}) Сводка системы и текущих настроек                      ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${BLUE}9${NC}) Создать ярлык в меню приложений + на рабочий стол       ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${RED}0${NC}) Выход                                                  ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
@@ -4001,6 +4002,119 @@ pause_console() {
     [[ -t 0 ]] || return 0
     printf '\n%s' "  Нажмите ENTER для возврата в меню…"
     IFS= read -r _ || true
+}
+
+# ─── Ярлык в графической оболочке (пункт меню 9) ──────────────────────────────
+# Позволяет запускать скрипт из файлового менеджера / меню приложений:
+# двойной клик по .desktop открывает терминал, в котором запускается alt_sync.sh
+# (при необходимости — с запросом пароля через sudo/pkexec в этом же терминале).
+create_desktop_shortcut() {
+    # Определяем «настоящего» пользователя оболочки (если запущены от root через sudo)
+    local target_uid="$SUDO_UID" target_user="$SUDO_USER"
+    if [[ -z "$target_user" ]]; then
+        # из окружения вызывающего процесса /proc/1 не берём; пробуем loginctl
+        target_user="$(loginctl list-users --no-legend 2>/dev/null | awk 'NR==1{print $NF}')" || true
+    fi
+    if [[ $EUID -eq 0 && -z "$target_user" ]]; then
+        step_warn "Не удалось определить пользователя graphical-сессии (запустите пункт 9 из-под обычного пользователя или задайте SUDO_USER)."
+        return 1
+    fi
+    if [[ $EUID -ne 0 ]]; then
+        target_uid="$(id -u)"
+        target_user="$(id -un)"
+    fi
+    if ! ask_yes_no "Создать ярлык «ALT Linux Universal Sync» в меню приложений и на рабочем столе?" y; then
+        printf '  Создание ярлыка отменено.\n'
+        return 0
+    fi
+    local home_dir
+    if [[ -n "$target_user" ]]; then
+        home_dir="$(getent passwd "$target_user" | cut -d: -f6)"
+    else
+        home_dir="$HOME"
+    fi
+    if [[ -z "$home_dir" || ! -d "$home_dir" ]]; then
+        step_warn "Домашний каталог пользователя не найден ($home_dir)."
+        return 1
+    fi
+
+    local term_exec="x-terminal-emulator"
+    local t
+    for t in gnome-terminal konsole xfce4-terminal mate-terminal lxterminal qterminal yterm alacritty kitty xterm; do
+        if command -v "$t" >/dev/null 2>&1; then term_exec="$t"; break; fi
+    done
+
+    # Команда внутри терминала: перезапуск от root через sudo (или pkexec), либо напрямую если уже root
+    local run_cmd
+    if command -v sudo >/dev/null 2>&1; then
+        run_cmd="sudo bash '$SELF'"
+    elif command -v pkexec >/dev/null 2>&1; then
+        run_cmd="pkenv=\$(for v in DISPLAY XAUTHORITY; do eval \"val=\\\$\$v\"; [ -n \"\$val\" ] && printf '%s=%s ' \"\$v\" \"\$val\"; done); pkenv=\"\${pkenv% }\" pkenv=\"\$pkenv ALT_SYNC_ALLOW_ROOT_RESTART=0\" pkexec env \$pkenv bash '$SELF'"
+    else
+        run_cmd="bash '$SELF'"
+    fi
+
+    local launch_line
+    case "$term_exec" in
+        gnome-terminal|x-terminal-emulator) launch_line="$term_exec -- bash -lc \"$run_cmd\"" ;;
+        *)                                   launch_line="$term_exec -e bash -lc \"$run_cmd\"" ;;
+    esac
+
+    local desktop_name="ALT Linux Universal Sync"
+    local fname="alt-sync.desktop"
+
+    local desktop_content
+    desktop_content=$(cat <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=$desktop_name
+Name[ru_RU]=$desktop_name
+Comment=Синхронизация эталона ALT Linux (консольная утилита)
+Comment[ru_RU]=Синхронизация эталона ALT Linux (консольная утилита)
+Exec=$launch_line
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;FileTools;Utility;
+StartupNotify=true
+Keywords=alt;linux;sync;backup;ethalon;
+EOF
+)
+
+    local apps_dir="$home_dir/.local/share/applications"
+    mkdir -p "$apps_dir"
+    printf '%s\n' "$desktop_content" > "$apps_dir/$fname"
+    chmod 644 "$apps_dir/$fname"
+    chown "$target_uid:$target_user" "$apps_dir/$fname" 2>/dev/null || true
+
+    local ok_count=1
+    step_ok "Ярлык создан в меню приложений: $apps_dir/$fname"
+
+    # Рабочий стол
+    local desk_dir=""
+    if command -v xdg-user-dir >/dev/null 2>&1; then
+        desk_dir="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+    fi
+    [[ -z "$desk_dir" || ! -d "$desk_dir" ]] && desk_dir="$home_dir/Desktop"
+    if [[ -d "$home_dir/Рабочий стол" ]]; then desk_dir="$home_dir/Рабочий стол"; fi
+    if [[ -d "$desk_dir" ]]; then
+        cp -f "$apps_dir/$fname" "$desk_dir/$fname"
+        chmod +x "$desk_dir/$fname"
+        chown "$target_uid:$target_user" "$desk_dir/$fname" 2>/dev/null || true
+        # Для Nautilus/Mate/Cinnamon: явно разрешаем исполнение
+        gio set "$desk_dir/$fname" metadata::trusted true 2>/dev/null || true
+        ok_count=$((ok_count+1))
+        step_ok "Ярлык скопирован на рабочий стол: $desk_dir/$fname"
+    else
+        step_warn "Каталог рабочего стола не найден — пропущено."
+    fi
+
+    # Автозапуск (опционально — не включаем без спроса)
+    printf '\n  %bТерминал для запуска:%b %s\n' "$BOLD" "$NC" "$term_exec"
+    printf '  %bЧтобы запустить:%b откройте меню приложений → «%s»,\n' "$BOLD" "$NC" "$desktop_name"
+    printf '  или дважды щёлкните по ярлыку на рабочем столе.\n'
+    printf '  Откроется окно терминала со старым интерактивным меню.\n'
+    return 0
 }
 
 system_summary() {
@@ -4070,6 +4184,9 @@ CLI-режим (для автоматизации; без аргументов �
   fetch-deps        [ЭТАЛОН, нужен интернет] Скачать все зависимости скрипта
                     в офлайн-кэш deps-rpm/ рядом со скриптом — для установки
                     на компьютерах БЕЗ интернета
+  desktop-shortcut  Создать ярлык .desktop в меню приложений и на рабочем столе:
+                    двойной клик открывает терминал с интерактивным меню этого
+                    скрипта (аналог пункта 9 меню; удобно запускать из оболочки)
 
 Флаги:
   -y, --yes         Неинтерактивный режим: на все вопросы отвечать «да»
@@ -4212,7 +4329,7 @@ main() {
                 ASSETS_DIR="$BACKUP_DIR/assets"
                 MACHINE_ID_FILE="$BACKUP_DIR/.machine_id"
                 ;;
-            export|export-offline|import|import-offline|cryptopro|verify|fetch-deps)
+            export|export-offline|import|import-offline|cryptopro|verify|fetch-deps|desktop-shortcut)
                 if [[ -n "$action" && "$action" != "$1" ]]; then
                     die "Нельзя указать два действия одновременно: '$action' и '$1'"
                 fi
@@ -4321,6 +4438,9 @@ main() {
             fetch-deps)
                 fetch_deps_cache || rc=$?
                 ;;
+            desktop-shortcut)
+                create_desktop_shortcut || rc=$?
+                ;;
         esac
         if (( rc == 0 )); then
             log "CLI action '$action' finished successfully"
@@ -4345,11 +4465,11 @@ main() {
 
         local choice=""
         if [[ -n "$INPUT_TTY" ]]; then
-            if ! read -rp "  Выбор [0-8]: " choice <"$INPUT_TTY"; then
+            if ! read -rp "  Выбор [0-9]: " choice <"$INPUT_TTY"; then
                 echo
                 exit 0
             fi
-        elif ! read -rp "  Выбор [0-8]: " choice; then
+        elif ! read -rp "  Выбор [0-9]: " choice; then
             echo
             exit 0
         fi
@@ -4406,6 +4526,10 @@ main() {
                 ;;
             8)
                 system_summary
+                ;;
+            9)
+                create_desktop_shortcut
+                pause_console
                 ;;
             0)
                 exit 0
