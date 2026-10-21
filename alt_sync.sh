@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.1-console"
+SCRIPT_VERSION="2.0.4-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -147,6 +147,7 @@ if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     YELLOW='\033[1;33m'
     BLUE='\033[0;34m'
     CYAN='\033[0;36m'
+    MAGENTA='\033[0;35m'
     BOLD='\033[1m'
     NC='\033[0m'
 else
@@ -155,6 +156,7 @@ else
     YELLOW=''
     BLUE=''
     CYAN=''
+    MAGENTA=''
     BOLD=''
     NC=''
 fi
@@ -250,11 +252,26 @@ fi
 # tee для показа меню). Переназначение fd 3 на файл ввода ломало вывод:
 # окно терминала «зависало» (меню не печаталось), хотя логи продолжали писаться.
 # Чтение ввода везде идёт через read ... <"$INPUT_TTY", отдельный fd не нужен.
-export INPUT_TTY
+#
+# ВАЖНО (v2.0.3): переменную INPUT_TTY больше НЕ экспортируем. Экспорт
+# «INPUT_TTY=/dev/tty» в окружение дочерних процессов приводил к конфликту с
+# systemd-юнитами и утилитами, использующими собственную переменную окружения
+# InputTTY/INPUT_TTY; при завершении дочернего процесса родительский шелл мог
+# получить ошибочное состояние и окно закрывалось сразу после баннера.
+# Функции ask_yes_no/pause_console используют глобальную переменную этого же
+# процесса — export для них не требуется.
+export -n INPUT_TTY 2>/dev/null || true
 
 _finish_log() {
     local rc=$?
     printf '%s INFO: Завершение работы (exit code %s)\n' "$(date '+%F %T')" "$rc" >> "$LOG_FILE" 2>/dev/null || true
+    # process-substitution (`exec > >(sed … | tee …)`) оставляет фоновый конвейер,
+    # который может ещё не дописать буфер в терминал. Ждём его с КОРОТКИМ
+    # таймаутом и гарантированно гасим, иначе при закрытии окна часть вывода
+    # терялась, а в редких случаях шелл «зависал» на wait.
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 3 bash -c 'wait' 2>/dev/null || true
+    fi
     wait 2>/dev/null || true
 }
 trap _finish_log EXIT
@@ -2613,7 +2630,20 @@ write_summary_report() {
     return 0
 }
 
+# Проверка жёстких пакетных зависимостей (rpm/flock/apt). Вызывается из
+# каждого пакетного действия — и из CLI, и из интерактивного меню — чтобы на
+# машине без rpm (например, Astra Linux) меню всё равно запускалось, а ясная
+# ошибка выдавалась только при реальном выборе экспорт/импорт/CryptoPro.
+require_pkg_tools() {
+    have_cmd rpm || die "Команда rpm недоступна и не установлена автоматически. Установите пакет rpm вручную."
+    have_cmd flock || die "Команда flock недоступна и не установлена автоматически. Установите пакет util-linux вручную."
+    if ! have_cmd apt-get && ! have_cmd epm; then
+        die "Нет пакетного менеджера (apt-get/epm) — невозможно восстановить слепок. Установите apt или epm."
+    fi
+}
+
 do_export() {
+    require_pkg_tools
     if ! mkdir -p "$BACKUP_DIR" 2>/dev/null; then
         die "Не удалось создать каталог бэкапа: $BACKUP_DIR"
     fi
@@ -3545,6 +3575,7 @@ post_import_services() {
 }
 
 do_import() {
+    require_pkg_tools
     if ! confirm_import; then
         return 1
     fi
@@ -3633,6 +3664,7 @@ do_import() {
 }
 
 do_cryptopro_only() {
+    require_pkg_tools
     init_steps 3
 
     step_start "Восстановление install-ассетов"
@@ -4033,6 +4065,11 @@ show_menu() {
     else
         printf '%b\n' "  ${BOLD}Права:${NC}    ${RED}нет root ✗${NC}"
     fi
+    # Индикатор вычисляется один раз перед циклом меню (см. main). Если он пуст
+    # (например, show_menu вызвана вне основного цикла) — показываем нейтрально.
+    if [[ -n "${PKG_TOOLS_STATUS:-}" ]]; then
+        printf '%b\n' "  ${BOLD}Пакетные инструменты:${NC} $PKG_TOOLS_STATUS"
+    fi
 
     if deps_cache_available; then
         local nrpm
@@ -4084,7 +4121,7 @@ pause_console() {
 # (при необходимости — с запросом пароля через sudo/pkexec в этом же терминале).
 create_desktop_shortcut() {
     # Определяем «настоящего» пользователя оболочки (если запущены от root через sudo)
-    local target_uid="$SUDO_UID" target_user="$SUDO_USER"
+    local target_uid="${SUDO_UID:-}" target_user="${SUDO_USER:-}"
     if [[ -z "$target_user" ]]; then
         # из окружения вызывающего процесса /proc/1 не берём; пробуем loginctl
         target_user="$(loginctl list-users --no-legend 2>/dev/null | awk 'NR==1{print $NF}')" || true
@@ -4096,6 +4133,11 @@ create_desktop_shortcut() {
     if [[ $EUID -ne 0 ]]; then
         target_uid="$(id -u)"
         target_user="$(id -un)"
+    fi
+    # fallback: если uid не определён (например, запуск через su без SUDO_UID),
+    # берём uid найденного пользователя
+    if [[ -z "$target_uid" && -n "$target_user" ]]; then
+        target_uid="$(id -u "$target_user" 2>/dev/null)" || target_uid=""
     fi
     if ! ask_yes_no "Создать ярлык «ALT Linux Universal Sync» в меню приложений и на рабочем столе?" y; then
         printf '  Создание ярлыка отменено.\n'
@@ -4489,11 +4531,13 @@ main() {
         else
             log "INFO: Установка зависимостей отклонена пользователем — использую доступные механизмы."
         fi
-        have_cmd rpm || die "Команда rpm недоступна и не установлена автоматически. Установите пакет rpm вручную."
-        have_cmd flock || die "Команда flock недоступна и не установлена автоматически. Установите пакет util-linux вручную."
-        if ! have_cmd apt-get && ! have_cmd epm; then
-            die "Нет пакетного менеджера (apt-get/epm) — невозможно восстановить слепок. Установите apt или epm."
-        fi
+        # Раньше здесь был безусловный die() при отсутствии rpm/flock/apt —
+        # на машине без /bin/rpm (Astra Linux) окно закрывалось сразу после
+        # баннера, так и не показав меню. Теперь жёсткие проверки перенесены
+        # в require_pkg_tools(), который вызывается из каждого пакетного
+        # действия (do_export/do_import/do_cryptopro_only) — и из CLI, и из
+        # интерактивного меню. Меню и пункты «Сводка», «Проверка бэкапа»,
+        # «Ярлык» работают и без rpm.
     fi
 
     if [[ -n "$action" ]]; then
@@ -4554,6 +4598,21 @@ main() {
         log "ERROR: Interactive menu requested without a TTY (stdin=$(readlink -f /proc/self/fd/0 2>/dev/null || echo unknown)) — refusing to hang."
         return 3
     fi
+
+    # ── Индикатор доступности пакетных инструментов в шапке меню ────────────
+    # Если rpm/apt отсутствуют, экспорт/импорт/CryptoPro не смогут работать.
+    # Пользователь должен видеть это ДО выбора пункта, а не получать «мёртвое»
+    # окно после нажатия цифры.
+    PKG_TOOLS_STATUS=""
+    if have_cmd rpm && { have_cmd apt-get || have_cmd epm; }; then
+        PKG_TOOLS_STATUS="${GREEN}rpm + пакетный менеджер ✓${NC}"
+    else
+        local _pt_missing=""
+        have_cmd rpm || _pt_missing+="rpm "
+        { have_cmd apt-get || have_cmd epm; } || _pt_missing+="apt-get/epm "
+        PKG_TOOLS_STATUS="${RED}нет ${_pt_missing% } ✗ (экспорт/импорт будут недоступны)${NC}"
+    fi
+
     while true; do
         show_menu
 
@@ -4577,6 +4636,7 @@ main() {
                         step_warn "Экспорт завершился с ошибками."
                     fi
                 fi
+                pause_console
                 ;;
             2)
                 if prepare_export 0; then
@@ -4584,6 +4644,7 @@ main() {
                         step_warn "Экспорт завершился с ошибками."
                     fi
                 fi
+                pause_console
                 ;;
             3)
                 if prepare_import_interactive; then
@@ -4591,6 +4652,7 @@ main() {
                         step_warn "Импорт завершился с ошибками или отменён."
                     fi
                 fi
+                pause_console
                 ;;
             4)
                 if prepare_import_offline; then
@@ -4598,6 +4660,7 @@ main() {
                         step_warn "Офлайн-импорт завершился с ошибками или отменён."
                     fi
                 fi
+                pause_console
                 ;;
             5)
                 if prepare_crypto_interactive; then
@@ -4605,6 +4668,7 @@ main() {
                         step_warn "Установка CryptoPro завершилась с ошибками."
                     fi
                 fi
+                pause_console
                 ;;
             6)
                 if ! do_verify; then
@@ -4620,6 +4684,7 @@ main() {
                 ;;
             8)
                 system_summary
+                pause_console
                 ;;
             9)
                 create_desktop_shortcut
