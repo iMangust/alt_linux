@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.11-console"
+SCRIPT_VERSION="2.0.12-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -616,8 +616,14 @@ DEPENDENCY_SPECS=(
     "7za|p7zip p7zip-full"
     "unzip|unzip"
     "epm|epm"
-    "whiptail|newt whiptail libnewt"
-    "pkexec|polkit libpolkit polkit-demo-utils"
+    # ВАЖНО (v2.0.12): в ALT Linux p10/p11 пакет newt НЕ существует — библиотека
+    # называется libnewt52/libnewt, а /usr/bin/whiptail поставляется пакетом
+    # newt-preinstall (или libnewt-devel). Старый список «newt whiptail libnewt»
+    # резолвился неверно (см. ниже — кандидаты теперь перебираются по одному),
+    # но имена приведены к реально существующим в ALT.
+    "whiptail|newt-preinstall libnewt libnewt52 newt"
+    "dialog|dialog CD-ROM-dialog"
+    "pkexec|libpolkit polkit polkit-demo-utils"
 )
 
 # Разворачивает «cmd|pkg1 pkg2 ...» в массив кандидатов
@@ -946,59 +952,56 @@ ensure_packages_present() {
 }
 
 auto_install_dependencies() {
-    local -a need_pkgs=()
-    local spec c p
-    local -A opt_pkgs=([dialog]=1)
+    # v2.0.12: переписано с «списка имён пакетов» на «список недостающих КОМАНД».
+    # Раньше в message/log попадала вся строка кандидатов целиком («newt whiptail
+    # libnewt»), и её пытались резолвить как одно имя пакета — отсюда ложное
+    # «не найдено ни в одном репозитории». Теперь для каждой недостающей команды
+    # кандидаты (реальные имена пакетов ALT) перебираются по одному.
+    local -a missing_cmds=()
+    local spec c
     for spec in "${DEPENDENCY_SPECS[@]}"; do
-        c="${spec%%|*}"; p="${spec#*|}"
-        if ! have_cmd "$c"; then
-            need_pkgs+=("$p")
-        fi
+        c="${spec%%|*}"
+        have_cmd "$c" || missing_cmds+=("$c")
     done
-    ((${#need_pkgs[@]} == 0)) && { log "INFO: Все зависимости на месте."; return 0; }
-    local -A seen=(); local -a uniq=()
-    for p in "${need_pkgs[@]}"; do
-        [[ -n "${seen[$p]:-}" ]] && continue
-        seen["$p"]=1; uniq+=("$p")
-    done
-    info "Не хватает зависимостей (${#uniq[@]}): ${uniq[*]}. Пробую установить автоматически..."
+    ((${#missing_cmds[@]} == 0)) && { log "INFO: Все зависимости на месте."; return 0; }
+    info "Не хватает зависимостей (${#missing_cmds[@]}): ${missing_cmds[*]}. Пробую установить автоматически..."
     set +e
     # ВАЖНО (v2.0.9): обновляем индексы репозиториев ДО резолвинга кандидатов.
     # Без этого apt-cache работает по устаревшему локальному кэшу списков и
     # ложно сообщает «пакет не найден в репозиториях» при первом запуске.
     refresh_repo_indexes_once
-    local -a still_missing=()
+
+    # Сначала — офлайн-кэш (по командам: внутри он сам разворачивает кандидатов)
     if deps_cache_available; then
         info "Пробую установить недостающие зависимости из офлайн-кэша: $DEPS_CACHE_DIR"
-        install_pkgs_from_offline_cache "${uniq[@]}" || true
-        for p in "${uniq[@]}"; do
-            have_cmd "$(pkg_for_cmd_reverse "$p")" || still_missing+=("$p")
-        done
-    else
-        still_missing=("${uniq[@]}")
+        install_pkgs_from_offline_cache "${missing_cmds[@]}" || true
     fi
-    if ((${#still_missing[@]} > 0)); then
-        local ok=0 fail=0 resolved rc
-        local -a skipped=()
-        for p in "${still_missing[@]}"; do
-            # Резолвим имя пакета среди кандидатов спеки: берём тот, который
-            # реально есть в rpm/apt-cache/epm. Если ни один кандидат не найден —
-            # пропускаем с понятным сообщением вместо бесконечных неудачных попыток.
-            resolved="$(resolve_pkg_candidate_by_pkgname "$p")"; rc=$?
-            if (( rc != 0 )); then
-                warn "Пакет '$p' не найден ни в одном включённом репозитории (проверены кандидаты: $(candidates_for_pkgname "$p")). Пропускаю — будет использован fallback."
-                skipped+=("$p")
-                continue
-            fi
-            if install_pkg_by_name "$resolved"; then
-                ok=$((ok+1)); log "INFO: установлен пакет $resolved."
-            else
-                fail=$((fail+1)); warn "Не удалось установить пакет: $resolved"
-            fi
-        done
-        ((${#skipped[@]} > 0)) && log "INFO: пропущены недоступные зависимости: ${skipped[*]} (скрипт продолжит работу через fallback-механизмы)."
-        log "INFO: автоустановка зависимостей из сети: успех=$ok, ошибок=$fail."
-    fi
+
+    local ok=0 fail=0 resolved rc
+    local -a skipped=()
+    for c in "${missing_cmds[@]}"; do
+        have_cmd "$c" && { ok=$((ok+1)); continue; }   # уже поставился из кэша
+        # Резолвим имя пакета среди кандидатов спеки команды: берём тот, который
+        # реально есть в rpm/apt-cache/epm. Если ни один кандидат не найден —
+        # пропускаем с понятным сообщением вместо бесконечных неудачных попыток.
+        resolved="$(resolve_pkg_for_cmd "$c")"; rc=$?
+        if (( rc != 0 )); then
+            spec_candidates_for_display=""
+            for spec in "${DEPENDENCY_SPECS[@]}"; do
+                [[ "${spec%%|*}" == "$c" ]] && spec_candidates_for_display="${spec#*|}"
+            done
+            warn "Для команды '$c' не найден ни один устанавливаемый пакет в реестре ни в одном включённом репозитории (проверены кандидаты: ${spec_candidates_for_display:-$c}). Пропускаю — будет использован fallback."
+            skipped+=("$c")
+            continue
+        fi
+        if install_pkg_by_name "$resolved"; then
+            ok=$((ok+1)); log "INFO: установлен пакет $resolved (команда: $c)."
+        else
+            fail=$((fail+1)); warn "Не удалось установить пакет: $resolved (команда: $c)"
+        fi
+    done
+    ((${#skipped[@]} > 0)) && log "INFO: пропущены недоступные зависимости: ${skipped[*]} (скрипт продолжит работу через fallback-механизмы)."
+    log "INFO: автоустановка зависимостей: успех=$ok, ошибок=$fail."
     set -e
 }
 
@@ -1129,27 +1132,38 @@ install_pkgs_from_offline_cache() {
 
     local p c still_missing=()
     for p in "${pkgs[@]}"; do
-        # v2.0.9: в кэше может лежать пакет-кандидат под другим именем (xz вместо
-        # xz-utils и т.п.) — собираем полный список кандидатов для проверки.
+        # v2.0.12: аргументы могут быть ИМЕНАМИ КОМАНД (whiptail, bsdtar) —
+        # разворачиваем их в кандидатов через DEPENDENCY_SPECS; если это уже
+        # имя пакета (libnewt и т.п.), оно остаётся в списке как есть.
+        if [[ -n "$(pkg_to_cmds "$p")" ]]; then
+            p="$(pkg_for_cmd "$p")"
+        fi
+        # Собираем полный список кандидатов (xz вместо xz-utils и т.п.).
         local -a pcands=("$p")
         read -ra _tmpc <<< "$(candidates_for_pkgname "$p")" 2>/dev/null || true
         for _tc in "${_tmpc[@]}"; do [[ " ${pcands[*]} " == *" $_tc "* ]] || pcands+=("$_tc"); done
-        if (( APT_LOCAL_ENABLED == 1 )) && apt_install_local "$p"; then
-            log "INFO: пакет $p установлен из офлайн-кэша ($DEPS_CACHE_DIR)."
-            continue
-        fi
+        # Пробуем установить каждого кандидата по одному имени (apt не знает
+        # про «или» — раньше вся строка кандидатов целиком передавалась как
+        # одно имя пакета и гарантированно падала).
+        local _pc_installed=""
+        for _tc in "${pcands[@]}"; do
+            if (( APT_LOCAL_ENABLED == 1 )) && apt_install_local "$_tc"; then
+                log "INFO: пакет $_tc установлен из офлайн-кэша ($DEPS_CACHE_DIR)."
+                _pc_installed="$_tc"; break
+            fi
+        done
+        [[ -n "$_pc_installed" ]] && continue
         if (( have_rpm )) && have_cmd rpm; then
             rpm -Uhv --replacepkgs --nodeps "$DEPS_CACHE_DIR"/*.rpm </dev/null >>"${LOG_FILE:-/dev/null}" 2>&1 || true
         fi
-        if (( have_deb )); then
-            c="$(pkg_for_cmd_reverse "$p")"
-            if ! have_cmd "$c" && command -v dpkg >/dev/null 2>&1; then
+        if (( have_deb )) && command -v dpkg >/dev/null 2>&1; then
+            for _tc in "${pcands[@]}"; do
                 local debf
-                for debf in "$DEPS_CACHE_DIR"/"$p"_*.deb "$DEPS_CACHE_DIR"/"$p"-*.deb "$DEPS_CACHE_DIR"/"$p".deb; do
+                for debf in "$DEPS_CACHE_DIR"/"${_tc}"_*.deb "$DEPS_CACHE_DIR"/"${_tc}"-*.deb "$DEPS_CACHE_DIR"/"${_tc}".deb; do
                     [[ -f "$debf" ]] || continue
                     env DEBIAN_FRONTEND=noninteractive dpkg -i --force-depends "$debf" </dev/null >>"${LOG_FILE:-/dev/null}" 2>&1 || true
                 done
-            fi
+            done
         fi
         # Проверка «получен ли пакет»: команда доступна ИЛИ файл любого кандидата
         # лежит в кэше (для последующей сетевой доводки зависимостей).
@@ -1222,6 +1236,10 @@ fetch_deps_cache() {
     if have_cmd apt-get; then
         local _pol
         for ((i = total - 1; i >= 0; i--)); do
+            # v2.0.12: если элемент всё ещё содержит пробелы (ни один кандидат не
+            # был доступен по отдельности) — это список-спека, а не имя пакета;
+            # apt-cache policy по нему работать не может.
+            [[ "${pkgs[$i]}" == *" "* ]] && { notavail+=("${pkgs[$i]}"); unset 'pkgs[i]'; pkgs=("${pkgs[@]}"); continue; }
             _pol=$(apt-cache policy "${pkgs[$i]}" 2>/dev/null | grep -cE '^\s+[0-9]+:') || _pol=0
             if (( _pol == 0 )); then
                 notavail+=("${pkgs[$i]}")
@@ -1232,6 +1250,7 @@ fetch_deps_cache() {
     elif have_cmd epm; then
         local _e
         for ((i = total - 1; i >= 0; i--)); do
+            [[ "${pkgs[$i]}" == *" "* ]] && { notavail+=("${pkgs[$i]}"); unset 'pkgs[i]'; pkgs=("${pkgs[@]}"); continue; }
             if ! epm --no-prompt query "${pkgs[$i]}" >/dev/null 2>&1; then
                 notavail+=("${pkgs[$i]}")
                 unset 'pkgs[i]'
@@ -1248,22 +1267,33 @@ fetch_deps_cache() {
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/alt-sync-fetch.XXXXXX")" || die "mktemp не удался"
     add_cleanup_tmpdir "$tmp"
 
-    local batch=()
+    # v2.0.12: раньше весь батч (до 20 имён) скачивался одним вызовом
+    # «apt download» — одно отсутствующее имя ронило всю пачку, и в кэш
+    # ничего не попадало. Теперь качаем по одному имени с накоплением
+    # успешных файлов; ошибка по одному пакету не блокирует остальные.
+    local f copied=0 ok_dl=0 fail_dl=()
     local i
     for ((i = 0; i < total; i++)); do
-        batch+=("${pkgs[$i]}")
         done_n=$((done_n + 1))
         progress_bar "$done_n" "$total" "Скачивание зависимостей"
-        if (( ${#batch[@]} >= 20 )) || (( done_n == total )); then
-            (
-                cd "$tmp" || exit 1
-                apt_with_timeout 300 "${APT_NET_OPTS[@]}" download "${batch[@]}" </dev/null >>"$LOG_FILE" 2>&1
-            ) || failed+=("${batch[*]}")
-            batch=()
+        if ( cd "$tmp" || exit 1
+             apt_with_timeout 120 "${APT_NET_OPTS[@]}" download "${pkgs[$i]}" </dev/null >>"$LOG_FILE" 2>&1 ); then
+            ok_dl=$((ok_dl+1))
+        else
+            # резервный канал: --download-only через install (ловит зависимости)
+            if apt_with_timeout 300 "${APT_NET_OPTS[@]}" "${APT_NO_PROMPT_OPTS[@]}" \
+                    install --download-only -y "${pkgs[$i]}" </dev/null >>"$LOG_FILE" 2>&1; then
+                local _dlcached
+                while IFS= read -r -d '' _dlcached; do
+                    safe_copy "$_dlcached" "$tmp" 2>/dev/null || true
+                done < <(find /var/cache/apt/archives -maxdepth 1 -name "${pkgs[$i]}_*.rpm" -o -maxdepth 1 -name "${pkgs[$i]}_*.deb" -print0 2>/dev/null)
+                ok_dl=$((ok_dl+1))
+            else
+                fail_dl+=("${pkgs[$i]}")
+            fi
         fi
     done
 
-    local f copied=0
     while IFS= read -r -d '' f; do
         safe_copy "$f" "$DEPS_CACHE_DIR" && copied=$((copied + 1))
     done < <(find "$tmp" -maxdepth 1 -type f \( -name '*.rpm' -o -name '*.deb' \) -print0 2>/dev/null)
@@ -1290,8 +1320,8 @@ fetch_deps_cache() {
         step_warn "Не удалось скачать ни одного пакета — проверьте интернет и репозитории."
         return 1
     fi
-    if ((${#failed[@]} > 0)); then
-        step_warn "Часть пакетов не скачалась: ${failed[*]} (см. техлог)."
+    if ((${#fail_dl[@]} > 0)); then
+        step_warn "Часть пакетов не скачалась: ${fail_dl[*]} (см. техлог)."
     fi
     step_ok "Офлайн-кэш готов: $DEPS_CACHE_DIR ($copied пакетов, $(du -sh "$DEPS_CACHE_DIR" 2>/dev/null | cut -f1))."
     info "Перенесите весь каталог скрипта (включая deps-rpm/) на компьютеры без интернета — зависимости установятся автономно."
