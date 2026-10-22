@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.14-console"
+SCRIPT_VERSION="2.0.15-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -612,10 +612,13 @@ DEPENDENCY_SPECS=(
     "unrar|unrar unrar-nonfree"
     "unar|unar"
     "bsdtar|libarchive-tools libarchive bsd-tar"
-    "7z|p7zip p7zip-full"
-    "7za|p7zip p7zip-full"
+    # v2.0.15: в ALT Linux пакета «p7zip» нет — 7z/7za поставляет пакет 7-zip
+    # (подтверждено практикой: apt-get install p7zip-full -> E: Невозможно найти
+    # пакет p7zip-full; виртуальное имя p7zip резолвится в 7-zip).
+    "7z|7-zip p7zip p7zip-full"
+    "7za|7-zip p7zip p7zip-full"
     "unzip|unzip"
-    "epm|epm"
+    "epm|eepm epm"
     # ВАЖНО (v2.0.14): подтверждено практикой — libnewt/libnewt52 содержат ТОЛЬКО
     # разделяемую библиотеку libnewt.so и НЕ ставят /usr/bin/whiptail
     # («Последняя версия libnewt52 уже установлена», а whiptail так и нет).
@@ -630,7 +633,7 @@ DEPENDENCY_SPECS=(
     #       установки скрипт проверяет наличие команды (см. install_cmd_by_candidates).
     "whiptail|newt52 newt-preinstall whiptail libnewt libnewt52"
     "dialog|dialog CD-ROM-dialog"
-    "pkexec|libpolkit polkit polkit-demo-utils"
+    "pkexec|polkit polkit-askpass-server libpolkit"
 )
 
 # Разворачивает «cmd|pkg1 pkg2 ...» в массив кандидатов
@@ -652,6 +655,53 @@ pkg_for_cmd() {
     printf '%s' "$1"
 }
 
+# v2.0.15: проверка доступности пакета (в т.ч. виртуального имени) через
+# симуляцию apt-get install -s без сети. Возвращает 0, если apt собрался
+# установить/обновить пакет или он уже установлен последней версией.
+simulate_apt_install_ok() {
+    local p="$1" out rc
+    [[ -z "$p" || "$p" == *" "* ]] && return 1
+    have_cmd apt-get || return 1
+    # ВНИМАНИЕ: «0 будет обновлено» содержит подстроку «будет обновлено», но
+    # означает отсутствие изменений — поэтому проверяем НОВЫЕ/обновление явно.
+    out="$(apt_with_timeout 60 env DEBIAN_FRONTEND=noninteractive \
+            apt-get -s install -y --no-install-recommends "$p" </dev/null 2>/dev/null)" && rc=0 || rc=$?
+    (( rc == 0 )) || return 1
+    grep -qE 'НОВЫЕ пакеты будут установлены|будут установлены' <<<"$out" && return 0
+    grep -qE '[1-9][0-9]* будет обновлено' <<<"$out" && return 0
+    grep -qE 'уже установлена' <<<"$out" && return 0
+    return 1
+}
+
+# v2.0.15: разворачивает имя пакета (в т.ч. виртуальное ALT-имя вроде xz/p7zip/
+# eepm/libpolkit) в список реальных бинарных имён пакетов. Использует вывод
+# apt-cache show и симуляцию apt-get -s install (локализация ru/en). Пустой
+# вывод + код 1 — не удалось; тогда возвращается исходное имя как есть.
+pkg_to_bin_nvras() {
+    local p="$1" line name out="" seen=" "
+    [[ -z "$p" || "$p" == *" "* ]] && return 1
+    have_cmd apt-get || { printf '%s' "$p"; return 0; }
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"     # trim leading spaces
+        case "$line" in
+            Package:*|Пакет:*) name="${line#*:}" ;;
+            *) continue ;;
+        esac
+        name="${name#"${name%%[![:space:]]*}"}"     # trim
+        name="${name%% *}"
+        [[ -z "$name" ]] && continue
+        [[ "$name" == *-devel* || "$name" == *-debug* || "$name" == *-doc* ]] && continue
+        [[ "$seen" == *" $name "* ]] && continue
+        seen+=" $name "
+        out+="$name "
+    done < <( apt-cache show "$p" 2>/dev/null | sed -n 's/^Package:[[:space:]]*//p; s/^Пакет:[[:space:]]*//p' )
+    if [[ -n "$out" ]]; then printf '%s' "${out% }"; return 0; fi
+    # не резолвится через show (виртуальное имя) — оставляем исходное имя:
+    # apt-get download/install сами умеют разворачивать виртуальные имена.
+    printf '%s' "$p"
+    return 1
+}
+
 # Возвращает 0 и печатает имя пакета, который реально доступен для установки
 # (уже установлен ИЛИ найден хотя бы в одном включённом репозитории).
 resolve_pkg_candidate() {
@@ -666,7 +716,18 @@ resolve_pkg_candidate() {
             if apt-cache show "$p" >/dev/null 2>&1; then printf '%s' "$p"; return 0; fi
         done
     fi
-    # epm-query как резервный канал проверки
+    # v2.0.15: виртуальные имена ALT (libpolkit, apt, rpm, libarchive и т.п.)
+    # apt-cache show НЕ резолвит сам — они видны только через «apt-get -s install».
+    # Поэтому дополнительно пробуем симуляцию установки для каждого кандидата.
+    if have_cmd apt-get; then
+        for p in "${candidates[@]}"; do
+            if simulate_apt_install_ok "$p"; then printf '%s' "$p"; return 0; fi
+        done
+    fi
+    # v2.0.15: если apt-cache show не резолвит имя (виртуальные имена вроде xz,
+    # p7zip, eepm могут отсутствовать как Package:) — пробуем epm-query ниже,
+    # а финальную проверку доступности делает pkg_to_bin_nvras/simulate на этапе
+    # скачивания (см. fetch_deps_cache). Здесь — только быстрые проверки.
     if have_cmd epm; then
         for p in "${candidates[@]}"; do
             if epm --no-prompt query "$p" >/dev/null 2>&1; then printf '%s' "$p"; return 0; fi
@@ -1298,8 +1359,10 @@ fetch_deps_cache() {
             # был доступен по отдельности) — это список-спека, а не имя пакета;
             # apt-cache policy по нему работать не может.
             [[ "${pkgs[$i]}" == *" "* ]] && { notavail+=("${pkgs[$i]}"); unset 'pkgs[i]'; pkgs=("${pkgs[@]}"); continue; }
+            # v2.0.15: доступность = есть в apt-cache policy ИЛИ резолвится через
+            # apt-cache show/симуляцию установки (виртуальные имена ALT).
             _pol=$(apt-cache policy "${pkgs[$i]}" 2>/dev/null | grep -cE '^\s+[0-9]+:') || _pol=0
-            if (( _pol == 0 )); then
+            if (( _pol == 0 )) && ! simulate_apt_install_ok "${pkgs[$i]}"; then
                 notavail+=("${pkgs[$i]}")
                 unset 'pkgs[i]'
                 pkgs=("${pkgs[@]}")
@@ -1317,39 +1380,86 @@ fetch_deps_cache() {
         done
     fi
     ((${#notavail[@]} > 0)) && log "INFO: пропущены недоступные в репозиториях пакеты (все кандидаты исчерпаны): ${notavail[*]}"
-    total=${#pkgs[@]}
+
+    # v2.0.15: если ни один кандидат спеки не разрешился (резолвер вернул список
+    # через пробел или первое имя), перебираем ВСЕ имена кандидатов по одному и
+    # оставляем только реально доступные (например, для whiptail: newt52, а не
+    # несуществующий «whiptail»).
+    local -a exp=()
+    for p in "${pkgs[@]}"; do
+        if [[ "$p" == *" "* ]]; then
+            read -ra _xc <<< "$p"
+            for _x in "${_xc[@]}"; do
+                have_cmd rpm && rpm -q "$_x" >/dev/null 2>&1 && { exp+=("$_x"); continue; }
+                apt-cache show "$_x" >/dev/null 2>&1 && exp+=("$_x")
+            done
+        else
+            exp+=("$p")
+        fi
+    done
+    pkgs=("${exp[@]}"); total=${#pkgs[@]}
+
+    # v2.0.15: «apt download» работает ТОЛЬКО с реальными бинарными NVRA-именами
+    # (например, 7-zip-25.01-alt1.x86_64). Виртуальные имена ALT (xz -> xz-file/
+    # xz-python3, p7zip -> 7-zip, eepm и т.п.) он не умеет и падает с ошибкой по
+    # всей пачке — из-за этого deps-rpm/ оставался пустым даже при исправном
+    # интернете. Разворачиваем каждое имя в список конкретных NVRA через
+    # apt-cache show / симуляцию apt-get -s install.
+    local -a dl_pkgs=()
+    for p in "${pkgs[@]}"; do
+        local _nvras
+        _nvras="$(pkg_to_bin_nvras "$p")"
+        if [[ -n "$_nvras" && "$_nvras" != *$'\n'* ]]; then
+            read -ra _ns <<< "$_nvras"
+            for _n in "${_ns[@]}"; do dl_pkgs+=("$_n"); done
+        else
+            dl_pkgs+=("$p")
+        fi
+    done
+    pkgs=("${dl_pkgs[@]}"); total=${#pkgs[@]}
+
     if (( total == 0 )); then
         step_warn "Все проверяемые пакеты уже установлены или недоступны — скачивать нечего."
         return 0
     fi
+    # v2.0.15: раньше качался только ОТСУТСТВУЮЩИЙ набор кандидатов, а пакеты,
+    # уже установленные на эталоне (xz, gzip, util-linux, apt, rpm, dialog...),
+    # в кэш НЕ попадали — на офлайн-клиентах их было нечем ставить, и папка
+    # deps-rpm/ оставалась пустой. Теперь в кэш скачиваются ВСЕ резолвящиеся
+    # зависимости (в т.ч. уже установленные) + транзитивные зависимости через
+    # резервный канал install --download-only.
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/alt-sync-fetch.XXXXXX")" || die "mktemp не удался"
     add_cleanup_tmpdir "$tmp"
 
-    # v2.0.12: раньше весь батч (до 20 имён) скачивался одним вызовом
-    # «apt download» — одно отсутствующее имя ронило всю пачку, и в кэш
-    # ничего не попадало. Теперь качаем по одному имени с накоплением
-    # успешных файлов; ошибка по одному пакету не блокирует остальные.
     local f copied=0 ok_dl=0 fail_dl=()
-    local i
-    for ((i = 0; i < total; i++)); do
-        done_n=$((done_n + 1))
-        progress_bar "$done_n" "$total" "Скачивание зависимостей"
+    local i j _dlcached
+    # v2.0.15: качаем пачками по 12 имён одним вызовом (быстрее), при неудаче
+    # пачки повторяем поштучно — один сбойный пакет не блокирует остальные.
+    for ((i = 0; i < total; i += 12)); do
+        local -a batch=("${pkgs[@]:i:12}")
         if ( cd "$tmp" || exit 1
-             apt_with_timeout 120 "${APT_NET_OPTS[@]}" download "${pkgs[$i]}" </dev/null >>"$LOG_FILE" 2>&1 ); then
-            ok_dl=$((ok_dl+1))
+             apt_with_timeout 300 "${APT_NET_OPTS[@]}" download "${batch[@]}" </dev/null >>"$LOG_FILE" 2>&1 ); then
+            ok_dl=$(( ok_dl + ${#batch[@]} ))
         else
-            # резервный канал: --download-only через install (ловит зависимости)
-            if apt_with_timeout 300 "${APT_NET_OPTS[@]}" "${APT_NO_PROMPT_OPTS[@]}" \
-                    install --download-only -y "${pkgs[$i]}" </dev/null >>"$LOG_FILE" 2>&1; then
-                local _dlcached
-                while IFS= read -r -d '' _dlcached; do
-                    safe_copy "$_dlcached" "$tmp" 2>/dev/null || true
-                done < <(find /var/cache/apt/archives -maxdepth 1 -name "${pkgs[$i]}_*.rpm" -o -maxdepth 1 -name "${pkgs[$i]}_*.deb" -print0 2>/dev/null)
-                ok_dl=$((ok_dl+1))
-            else
-                fail_dl+=("${pkgs[$i]}")
-            fi
+            for ((j = 0; j < ${#batch[@]}; j++)); do
+                done_n=$((done_n + 1))
+                progress_bar "$done_n" "$total" "Скачивание зависимостей"
+                if ( cd "$tmp" || exit 1
+                     apt_with_timeout 120 "${APT_NET_OPTS[@]}" download "${batch[$j]}" </dev/null >>"$LOG_FILE" 2>&1 ); then
+                    ok_dl=$((ok_dl+1))
+                elif apt_with_timeout 300 "${APT_NET_OPTS[@]}" "${APT_NO_PROMPT_OPTS[@]}" \
+                        install --download-only -y "${batch[$j]}" </dev/null >>"$LOG_FILE" 2>&1; then
+                    while IFS= read -r -d '' _dlcached; do
+                        safe_copy "$_dlcached" "$tmp" 2>/dev/null || true
+                    done < <(find /var/cache/apt/archives -maxdepth 1 \( -name '*.rpm' -o -name '*.deb' \) ! -name 'lock' -print0 2>/dev/null)
+                    ok_dl=$((ok_dl+1))
+                else
+                    fail_dl+=("${batch[$j]}")
+                fi
+            done
         fi
+        done_n=$((done_n + ${#batch[@]})); (( done_n > total )) && done_n=$total
+        progress_bar "$done_n" "$total" "Скачивание зависимостей"
     done
 
     while IFS= read -r -d '' f; do
