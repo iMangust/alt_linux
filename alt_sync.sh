@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.15-console"
+SCRIPT_VERSION="2.0.16-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -4152,6 +4152,252 @@ enable_crypto_services() {
     return 0
 }
 
+# ─── Принтеры/Сканеры: Epson и Pantum (v2.0.16) ───────────────────────────────
+# Отдельное подменю для установки принтеров/сканеров БЕЗ полного импорта
+# эталона. Работает на чистой машине: ставит зависимости из сети или из
+# офлайн-кэша deps-rpm/, затем сам драйвер. Уже установленное пропускается
+# (умная установка), принудительная переустановка — --force-reinstall /
+# OPT_FORCE_REINSTALL=1.
+
+# Установка драйверов сканеров Epson из репозиториев ALT (epsonscan2,
+# imagescan-sane, iscan-free, iscan-data, firmware-iscan). Это официальный
+# путь, которым пакеты были поставлены на эталоне вручную.
+install_epson_drivers() {
+    require_pkg_tools || return 1
+
+    info "Устанавливаю драйверы сканеров Epson (310/530): epsonscan2, imagescan-sane, iscan-free, iscan-data, firmware-iscan"
+
+    # Зависимости sane/cups обычно уже стоят вместе с imagescan, но на чистой
+    # системе их может не быть — ставим best-effort до основных пакетов.
+    local dep
+    for dep in sane-backends cups; do
+        if ! rpm -q "$dep" >/dev/null 2>&1; then
+            install_package_name "$dep" || true
+        fi
+    done
+
+    local pkg ok=0 fail=0 missing=()
+    for pkg in "${EPSON_PKGS[@]}"; do
+        if install_package_name "$pkg"; then
+            ok=$((ok + 1))
+        else
+            fail=$((fail + 1))
+            missing+=("$pkg")
+        fi
+    done
+
+    if (( fail == 0 )); then
+        step_ok "Драйверы Epson установлены/присутствуют ($ok шт.)."
+    elif (( ok > 0 )); then
+        step_warn "Epson: установлено $ok, не удалось: ${missing[*]}"
+        step_warn "Проверьте интернет (или выполните п.7 на эталоне и импорт офлайн)."
+    else
+        step_warn "Ни один пакет Epson установить не удалось."
+        return 1
+    fi
+
+    # Конфигурация SANE: если на эталоне был сохранён etc/sane.d — он
+    # восстанавливается полным импортом; здесь лишь включаем нужные бэкенды
+    # в локальном sane.d, если файл exists и бэкенд в нём закомментирован.
+    if [[ -f /etc/sane.d/dll.conf ]]; then
+        local be
+        for be in epson2 imagescan epson; do
+            if grep -q "^#\s*${be}\$" /etc/sane.d/dll.conf 2>/dev/null; then
+                sed -i "s/^#\(\s*${be}\$\)/\1/" /etc/sane.d/dll.conf 2>/dev/null || true
+            fi
+        done
+    fi
+
+    return 0
+}
+
+# Проверка наличия проприетарного пакета Pantum (переупакованного eepm).
+pantum_rpm_installed() {
+    rpm -qa 2>/dev/null | grep -qi 'pantum'
+}
+
+# Установка МФУ Pantum: сначала проверям, не восстановлен ли драйвер уже из
+# бэкапа (/opt/pantum), затем пробуем переупакованный RPM из локальных
+# источников (packages/, deps-rpm/, кэш eepm) — это работает офлайн. Только
+# если ничего не найдено — идём в сеть через «epm play pantum».
+install_pantum_driver() {
+    require_pkg_tools || return 1
+
+    if pantum_rpm_installed && [[ -d /usr/lib64/sane || -d /usr/lib/cups/filter ]] &&
+       (( FORCE_REINSTALL != 1 )); then
+        step_ok "Pantum уже установлен (rpm -qa | grep pantum). Пропускаю (для переустановки: --force-reinstall)."
+        return 0
+    fi
+
+    if [[ -d /opt/pantum ]] && ! pantum_rpm_installed && (( FORCE_REINSTALL != 1 )); then
+        info "Обнаружен /opt/pantum (восстановлен из vendor-ассетов), но RPM-пакета нет — докупаю метаданные драйвера по мере возможности."
+    fi
+
+    # Инструменты конвертации .deb -> .rpm нужны и для epm play, и для
+    # резервного канала ручной распаковки скачанного архива Pantum.
+    local conv_tool
+    for conv_tool in dpkg alien 7-zip unrar cpio rpm-build newt52; do
+        if ! rpm -q "$conv_tool" >/dev/null 2>&1; then
+            install_package_name "$conv_tool" || true
+        fi
+    done
+
+    # Канал 1 (офлайн): ищем готовые RPM/DEB Pantum в локальных источниках.
+    local found f
+    for dir in "$PACKAGES_DIR" "$DEPS_CACHE_DIR" "$BACKUP_DIR/packages" \
+               /var/cache/eepm /var/tmp; do
+        [[ -d "$dir" ]] || continue
+        while IFS= read -r -d '' f; do
+            case "$f" in
+                *.rpm)
+                    info "Найден локальный RPM Pantum: $f — устанавливаю..."
+                    if install_rpm_files_group "$f"; then
+                        step_ok "Pantum установлен из локального RPM (офлайн-канал)."
+                        return 0
+                    fi
+                    ;;
+                *.deb)
+                    info "Найден локальный DEB Pantum: $f — переупаковываю через alien..."
+                    local tmpd genrpm
+                    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/alt-sync-pantum.XXXXXX")" || continue
+                    add_cleanup_tmpdir "$tmpd"
+                    if alien --to-rpm --target x86_64 --install "$f" >/dev/null 2>&1 ||
+                       { (cd "$tmpd" && alien --generate --to-rpm "$f" >/dev/null 2>&1 && \
+                          genrpm="$(find "$tmpd" -maxdepth 1 -name 'pantum*.rpm' | head -n1)" && \
+                          [[ -n "$genrpm" ]] && install_rpm_files_group "$genrpm"); }; then
+                        step_ok "Pantum установлен из локального DEB (конвертация alien)."
+                        return 0
+                    fi
+                    ;;
+            esac
+        done < <(find "$dir" -maxdepth 2 -type f \( -iname 'pantum*.rpm' -o -iname 'pantum*.deb' \) -print0 2>/dev/null)
+    done
+
+    # Канал 2 (сеть): epm play pantum — официальный способ, которым драйвер
+    # ставился на эталоне вручную. epm сам качает zip с pantum.ru, распаковывает,
+    # переупаковывает .deb в .rpm и устанавливает.
+    if have_cmd epm || install_package_name eepm; then
+        info "Устанавливаю Pantum через epm play pantum (нужен доступ к pantum.ru)..."
+        export NONINTERACTIVE_FRONTEND=1 2>/dev/null || true
+        if epm play pantum </dev/null >>"$LOG_FILE" 2>&1; then
+            if pantum_rpm_installed; then
+                step_ok "Pantum установлен через epm play."
+                return 0
+            fi
+        fi
+        # Повтор после возможной докачки инструментов epm
+        if epm play pantum </dev/null >>"$LOG_FILE" 2>&1 && pantum_rpm_installed; then
+            step_ok "Pantum установлен через epm play (повторная попытка)."
+            return 0
+        fi
+        step_warn "epm play pantum не завершился успехом (нет сети или ошибка вендора)."
+    else
+        step_warn "epm/eepm недоступен ни в сети, ни в офлайн-кэше — epm play невозможен."
+    fi
+
+    step_warn "Pantum не установлен автоматически. Варианты:"
+    step_warn "  • на эталоне: sudo bash $SELF fetch-deps (и/или экспорт с vendor-ассетами), затем п.4 импорт офлайн;"
+    step_warn "  • вручную от root: apt-get update && apt-get install epm && epm play pantum;"
+    step_warn "  • положить PantumDriver-*.rpm в $DEPS_CACHE_DIR или $PACKAGES_DIR и повторить."
+    return 1
+}
+
+# Перезапуск служб печати/сканирования и обновление udev — чтобы свежеставшие
+# драйверы сразу определили устройства.
+restart_printing_services() {
+    local svc
+    for svc in cups avahi-daemon; do
+        try_restart_service "$svc" 15 || true
+    done
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >>"$LOG_FILE" 2>&1 || true
+        udevadm trigger >>"$LOG_FILE" 2>&1 || true
+    fi
+    info "Службы печати обновлены (cups/avahi/udev). Проверьте устройства в «Параметры печати» / sane-find-scanner."
+}
+
+# Статус компонента для отображения в подменю: installed / partial / absent.
+printer_component_status() {
+    local which="$1"
+    case "$which" in
+        epson)
+            local n=0 pkg
+            for pkg in "${EPSON_PKGS[@]}"; do
+                rpm -q "$pkg" >/dev/null 2>&1 && n=$((n + 1))
+            done
+            if (( n == ${#EPSON_PKGS[@]} )); then echo "установлен ($n/${#EPSON_PKGS[@]})"
+            elif (( n > 0 )); then echo "частично ($n/${#EPSON_PKGS[@]})"
+            else echo "не установлен"; fi
+            ;;
+        pantum)
+            if pantum_rpm_installed; then echo "установлен (RPM)"
+            elif [[ -d /opt/pantum ]]; then echo "файлы есть (/opt/pantum), RPM нет"
+            else echo "не установлен"; fi
+            ;;
+    esac
+}
+
+# Подменю «Принтеры/Сканеры»: отдельная установка Epson и Pantum со всеми
+# зависимостями, без остального импорта. Возвращает код последнего действия.
+menu_printers_scanners() {
+    while true; do
+        clear 2>/dev/null || printf '\n\n'
+        printf '%b\n' "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+        printf '%b\n' "${BOLD}${CYAN}║           ПРИНТЕРЫ / СКАНЕРЫ — установка компонентов          ║${NC}"
+        printf '%b\n' "${BOLD}${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+        printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}1${NC}) Epson 310/530 — сканеры (epsonscan2/imagescan/iscan)   ${BOLD}${CYAN}║${NC}"
+        printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}2${NC}) Pantum — МФУ (драйвер CUPS+SANE, epm play)             ${BOLD}${CYAN}║${NC}"
+        printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}3${NC}) Установить ОБА и перезапустить службы печати            ${BOLD}${CYAN}║${NC}"
+        printf '%b\n' "${BOLD}${CYAN}║${NC}  ${RED}0${NC}) Назад в главное меню                                   ${BOLD}${CYAN}║${NC}"
+        printf '%b\n' "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+        printf '%b\n' "  Текущий статус:"
+        printf '%b\n' "    Epson : $(printer_component_status epson)"
+        printf '%b\n' "    Pantum: $(printer_component_status pantum)"
+        if deps_cache_available; then
+            printf '%b\n' "    Офлайн-кэш: ${GREEN}есть${NC} ($DEPS_CACHE_DIR)"
+        else
+            printf '%b\n' "    Офлайн-кэш: ${YELLOW}отсутствует${NC} (для установки без интернета выполните п.7 на эталоне)"
+        fi
+        echo
+
+        printf '  Выбор [0-3]: '
+        if ! read_user_input ""; then
+            echo
+            return 0
+        fi
+        local subchoice
+        subchoice="$(printf '%s' "$REPLY_OUT" | tr -d '\r\n ')"
+
+        case "$subchoice" in
+            1)
+                install_epson_drivers
+                restart_printing_services
+                pause_console
+                ;;
+            2)
+                install_pantum_driver
+                restart_printing_services
+                pause_console
+                ;;
+            3)
+                install_epson_drivers || true
+                install_pantum_driver || true
+                restart_printing_services
+                pause_console
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                printf '%b\n' "${RED}  Неверный выбор.${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+
+
 # ─── Установка компонентов из папки install/ (v2.0.7) ────────────────────────
 # Ожидаемая структура: каждая ПОДПАПКА каталога install/ — это отдельный
 # компонент, имя папки = имя компонента (например, «КРИПТО ПРО» с файлами
@@ -5261,8 +5507,9 @@ show_menu() {
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${BLUE}5${NC}) Установка из install/ (выбор компонентов; CryptoPro)   ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${CYAN}6${NC}) Проверить бэкап (целостность)                          ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${GREEN}7${NC}) Скачать компоненты в офлайн-кэш (нужен интернет)       ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${MAGENTA}8${NC}) Сводка системы и текущих настроек                      ${BOLD}${CYAN}║${NC}"
-    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${BLUE}9${NC}) Создать ярлык в меню приложений + на рабочий стол       ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${MAGENTA}8${NC}) Принтеры/Сканеры (Epson 310/530, Pantum)              ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${BLUE}9${NC}) Сводка системы и текущих настроек                      ${BOLD}${CYAN}║${NC}"
+    printf '%b\n' "${BOLD}${CYAN}║${NC}  ${MAGENTA}a${NC}) Создать ярлык в меню приложений + на рабочий стол     ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}║${NC}  ${RED}0${NC}) Выход                                                  ${BOLD}${CYAN}║${NC}"
     printf '%b\n' "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 
@@ -5530,6 +5777,14 @@ CLI-режим (для автоматизации; без аргументов �
   fetch-deps        [ЭТАЛОН, нужен интернет] Скачать все зависимости скрипта
                     в офлайн-кэш deps-rpm/ рядом со скриптом — для установки
                     на компьютерах БЕЗ интернета
+  install-epson     Только драйверы сканеров Epson 310/530 + зависимости
+                    (epsonscan2, imagescan-sane, iscan-free, iscan-data,
+                    firmware-iscan; из сети или офлайн-кэша) — аналог п.8→1
+  install-pantum    Только МФУ Pantum + инструменты конвертации (dpkg, alien,
+                    7-zip, eepm): сначала локальные RPM/DEB, затем epm play —
+                    аналог п.8→2
+  install-printers  Epson + Pantum подряд и перезапуск cups/avahi/udev —
+                    аналог п.8→3
   desktop-shortcut  Создать ярлык .desktop в меню приложений и на рабочем столе:
                     двойной клик открывает терминал с интерактивным меню этого
                     скрипта (аналог пункта 9 меню; удобно запускать из оболочки)
@@ -5690,7 +5945,7 @@ main() {
                 ASSETS_DIR="$BACKUP_DIR/assets"
                 MACHINE_ID_FILE="$BACKUP_DIR/.machine_id"
                 ;;
-            export|export-offline|import|import-offline|cryptopro|install-components|verify|fetch-deps|desktop-shortcut)
+            export|export-offline|import|import-offline|cryptopro|install-components|verify|fetch-deps|desktop-shortcut|install-epson|install-pantum|install-printers)
                 if [[ -n "$action" && "$action" != "$1" ]]; then
                     die "Нельзя указать два действия одновременно: '$action' и '$1'"
                 fi
@@ -5815,6 +6070,24 @@ main() {
             desktop-shortcut)
                 create_desktop_shortcut || rc=$?
                 ;;
+            install-epson)
+                require_pkg_tools || rc=$?
+                (( rc == 0 )) && { install_epson_drivers || rc=$?; restart_printing_services; }
+                ;;
+            install-pantum)
+                require_pkg_tools || rc=$?
+                (( rc == 0 )) && { install_pantum_driver || rc=$?; restart_printing_services; }
+                ;;
+            install-printers)
+                require_pkg_tools || rc=$?
+                if (( rc == 0 )); then
+                    local rc_e=0 rc_p=0
+                    install_epson_drivers || rc_e=$?
+                    install_pantum_driver || rc_p=$?
+                    restart_printing_services
+                    (( rc_e != 0 || rc_p != 0 )) && rc=1
+                fi
+                ;;
         esac
         if (( rc == 0 )); then
             log "CLI action '$action' finished successfully"
@@ -5864,7 +6137,7 @@ main() {
         # выглядело «зависшим». printf гарантированно виден всегда.
         # Читает read_user_input: stdin=TTY или /dev/tty (прямой
         # «read ... </dev/tty» после su давал EIO).
-        printf '  Выбор [0-9]: '
+        printf '  Выбор [0-9, a]: '
         if ! read_user_input ""; then
             echo
             exit 0
@@ -5873,6 +6146,10 @@ main() {
 
         choice="$(printf '%s' "$choice" | tr -d '\r\n ')"
 
+        case "$choice" in
+            1|2|3|4|5|6|7|8|9|a|A|0) ;;
+            *) printf '%b\n' "${RED}  Неверный выбор.${NC}"; sleep 1; continue ;;
+        esac
         case "$choice" in
             1)
                 if prepare_export 1; then
@@ -5927,10 +6204,14 @@ main() {
                 pause_console
                 ;;
             8)
-                system_summary
+                menu_printers_scanners
                 pause_console
                 ;;
             9)
+                system_summary
+                pause_console
+                ;;
+            a|A)
                 create_desktop_shortcut
                 pause_console
                 ;;
