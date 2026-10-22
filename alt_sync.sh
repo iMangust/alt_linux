@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.13-console"
+SCRIPT_VERSION="2.0.14-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -616,17 +616,19 @@ DEPENDENCY_SPECS=(
     "7za|p7zip p7zip-full"
     "unzip|unzip"
     "epm|epm"
-    # ВАЖНО (v2.0.13): в ALT Linux p10/p11 пакета «newt» НЕ существует — это
-    # имя исходного пакета; библиотека упакована как libnewt52, а виртуальное
-    # имя libnewt разрешается apt в libnewt52 (проверено вручную:
-    # «Выбрано libnewt52 для 'libnewt'»). Порядок кандидатов важен:
-    #   1) libnewt      — стабильное виртуальное имя (резоlvится apt автоматически);
-    #   2) libnewt52    — реальное имя бинарного пакета библиотеки;
-    #   3) newt-preinstall — попытка угадать пакет с /usr/bin/whiptail (в ALT p11
-    #       не найден индексом, поэтому идёт ПОСЛЕ библиотек: раньше он стоял
-    #       первым и блокировал установку, т.к. недоступен в репозиториях);
-    #   4) whiptail     — на случай сторонних репозиториев с таким именем.
-    "whiptail|libnewt libnewt52 newt-preinstall whiptail"
+    # ВАЖНО (v2.0.14): подтверждено практикой — libnewt/libnewt52 содержат ТОЛЬКО
+    # разделяемую библиотеку libnewt.so и НЕ ставят /usr/bin/whiptail
+    # («Последняя версия libnewt52 уже установлена», а whiptail так и нет).
+    # Исполняемый whiptail в ALT Linux p10/p11 входит в бинарный пакет newt52
+    # (исходный пакет называется newt — такого бинарного пакета нет).
+    # Порядок кандидатов: сначала пакеты с самим исполняемым файлом, затем
+    # библиотеки как резервный канал зависимостей.
+    #   1) newt52           — пакет с /usr/bin/whiptail (правильное имя в p11);
+    #   2) newt-preinstall  — альтернативная упаковка whiptail (сторонние репо);
+    #   3) whiptail         — на случай репозиториев с выделенным пакетом;
+    #   4) libnewt libnewt52 — только библиотека; ставятся последними, и после их
+    #       установки скрипт проверяет наличие команды (см. install_cmd_by_candidates).
+    "whiptail|newt52 newt-preinstall whiptail libnewt libnewt52"
     "dialog|dialog CD-ROM-dialog"
     "pkexec|libpolkit polkit polkit-demo-utils"
 )
@@ -696,8 +698,15 @@ resolve_pkg_for_cmd() {
 # скрипт прекращал попытки, хотя следующий кандидат (libnewt52) гарантированно
 # устанавливался. Теперь кандидаты, найденные в индексах, пробуются по одному
 # до первого успеха; при полном неудачном исходе возвращается 1.
+# v2.0.14: добавлена финальная проверка «команда реально появилась» (have_cmd).
+# Практика показала: apt может рапортовать успех установки библиотеки
+# (libnewt/libnewt52 — «Последняя версия уже установлена»), но /usr/bin/whiptail
+# при этом отсутствует, т.к. исполняемый файл лежит в пакете newt52. Теперь
+# «успешной» считается только установка, после которой команда доступна;
+# иначе перебор кандидатов продолжается.
 install_cmd_by_candidates() {
     local want="$1" spec c cand found rc=1 tried=""
+    have_cmd "$want" && return 0
     for spec in "${DEPENDENCY_SPECS[@]}"; do
         c="${spec%%|*}"
         [[ "$c" == "$want" ]] || continue
@@ -706,8 +715,11 @@ install_cmd_by_candidates() {
         found="$(resolve_pkg_candidate "${__CANDIDATES[@]}")"; rc=$?
         if (( rc == 0 )); then
             if install_pkg_by_name "$found"; then
-                log "INFO: установлен пакет $found (команда: $want)."
-                return 0
+                if have_cmd "$want"; then
+                    log "INFO: установлен пакет $found (команда: $want)."
+                    return 0
+                fi
+                warn "Пакет '$found' установлен, но команда '$want' по-прежнему недоступна — пробую следующего кандидата."
             fi
             tried+=" $found"
         fi
@@ -716,8 +728,13 @@ install_cmd_by_candidates() {
             [[ "$cand" == "$found" ]] && continue
             [[ " $tried " == *" $cand "* ]] && continue
             if install_pkg_by_name "$cand"; then
-                log "INFO: установлен пакет $cand (команда: $want)."
-                return 0
+                if have_cmd "$want"; then
+                    log "INFO: установлен пакет $cand (команда: $want)."
+                    return 0
+                fi
+                # Кандидат установился, но бинарника нет (типично для библиотек
+                # libnewt52) — НЕ считаем это успехом, идём дальше.
+                warn "Пакет '$cand' установлен, но команда '$want' по-прежнему недоступна — пробую следующего кандидата."
             fi
             tried+=" $cand"
         done
@@ -823,9 +840,10 @@ EPSON_PKGS=(
 
 PANTUM_PKGS=(
     epm
-    # ВАЖНО: в ALT Linux пакет называется «libnewt» (не «newt»), а whiptail
-    # входит в пакет «newt»/«libnewt» — некорректные имена приводили к
-    # гарантированно падающей apt-get install в install_special_packages.
+    # ВАЖНО (v2.0.14): в ALT Linux p11 исполняемый whiptail (нужен интерактиву
+    # epm play pantum) входит в пакет newt52; libnewt/libnewt52 — только
+    # библиотека, сами по себе команду не дают.
+    newt52
     libnewt
     # Критично для «epm play pantum»: драйвер Pantum распространяется в виде
     # .deb, и eepm конвертирует его через dpkg-deb + alien. Без этих пакетов
