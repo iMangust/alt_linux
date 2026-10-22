@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.12-console"
+SCRIPT_VERSION="2.0.13-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -616,12 +616,17 @@ DEPENDENCY_SPECS=(
     "7za|p7zip p7zip-full"
     "unzip|unzip"
     "epm|epm"
-    # ВАЖНО (v2.0.12): в ALT Linux p10/p11 пакет newt НЕ существует — библиотека
-    # называется libnewt52/libnewt, а /usr/bin/whiptail поставляется пакетом
-    # newt-preinstall (или libnewt-devel). Старый список «newt whiptail libnewt»
-    # резолвился неверно (см. ниже — кандидаты теперь перебираются по одному),
-    # но имена приведены к реально существующим в ALT.
-    "whiptail|newt-preinstall libnewt libnewt52 newt"
+    # ВАЖНО (v2.0.13): в ALT Linux p10/p11 пакета «newt» НЕ существует — это
+    # имя исходного пакета; библиотека упакована как libnewt52, а виртуальное
+    # имя libnewt разрешается apt в libnewt52 (проверено вручную:
+    # «Выбрано libnewt52 для 'libnewt'»). Порядок кандидатов важен:
+    #   1) libnewt      — стабильное виртуальное имя (резоlvится apt автоматически);
+    #   2) libnewt52    — реальное имя бинарного пакета библиотеки;
+    #   3) newt-preinstall — попытка угадать пакет с /usr/bin/whiptail (в ALT p11
+    #       не найден индексом, поэтому идёт ПОСЛЕ библиотек: раньше он стоял
+    #       первым и блокировал установку, т.к. недоступен в репозиториях);
+    #   4) whiptail     — на случай сторонних репозиториев с таким именем.
+    "whiptail|libnewt libnewt52 newt-preinstall whiptail"
     "dialog|dialog CD-ROM-dialog"
     "pkexec|libpolkit polkit polkit-demo-utils"
 )
@@ -682,6 +687,41 @@ resolve_pkg_for_cmd() {
         fi
     done
     printf '%s' "$want"
+    return 1
+}
+
+# v2.0.13: установка недостающей КОМАНДЫ с полным перебором кандидатов.
+# Раньше, если первый доступный кандидат (например, виртуальное имя libnewt)
+# не резолвился apt-get в конкретный бинарный пакет и установка падала,
+# скрипт прекращал попытки, хотя следующий кандидат (libnewt52) гарантированно
+# устанавливался. Теперь кандидаты, найденные в индексах, пробуются по одному
+# до первого успеха; при полном неудачном исходе возвращается 1.
+install_cmd_by_candidates() {
+    local want="$1" spec c cand found rc=1 tried=""
+    for spec in "${DEPENDENCY_SPECS[@]}"; do
+        c="${spec%%|*}"
+        [[ "$c" == "$want" ]] || continue
+        spec_candidates "$spec"
+        # Сначала пробуем «умного» победителя (первого доступного в индексах)...
+        found="$(resolve_pkg_candidate "${__CANDIDATES[@]}")"; rc=$?
+        if (( rc == 0 )); then
+            if install_pkg_by_name "$found"; then
+                log "INFO: установлен пакет $found (команда: $want)."
+                return 0
+            fi
+            tried+=" $found"
+        fi
+        # ...затем ВСЕ остальные кандидаты по одному (пропускаем уже пробованные).
+        for cand in "${__CANDIDATES[@]}"; do
+            [[ "$cand" == "$found" ]] && continue
+            [[ " $tried " == *" $cand "* ]] && continue
+            if install_pkg_by_name "$cand"; then
+                log "INFO: установлен пакет $cand (команда: $want)."
+                return 0
+            fi
+            tried+=" $cand"
+        done
+    done
     return 1
 }
 
@@ -994,8 +1034,8 @@ auto_install_dependencies() {
             skipped+=("$c")
             continue
         fi
-        if install_pkg_by_name "$resolved"; then
-            ok=$((ok+1)); log "INFO: установлен пакет $resolved (команда: $c)."
+        if install_cmd_by_candidates "$c"; then
+            ok=$((ok+1))
         else
             fail=$((fail+1)); warn "Не удалось установить пакет: $resolved (команда: $c)"
         fi
