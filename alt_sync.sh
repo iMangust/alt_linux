@@ -19,7 +19,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0.10-console"
+SCRIPT_VERSION="2.0.11-console"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SELF="${BASH_SOURCE[0]}"
@@ -1698,6 +1698,19 @@ install_rpm_files_group() {
         return 1
     fi
 
+    # v2.0.11: групповой режим ставит ВСЕ переданные RPM за один вызов
+    # пакетного менеджера — это критично для КриптоПро: lsb-cprocsp-rdr,
+    # kc1, capilite, curl и ca-certs взаимозависимы, поштучная установка
+    # (rpm -Uvh по одному файлу) на чистой машине даёт ошибки зависимостей.
+    # Флаг-маркер FIRST_ONLY=1: установить только первый RPM из группы
+    # (используется для compat-пакета КриптоПро, который должен появиться
+    # раньше остальных).
+    local FIRST_ONLY=0
+    if [[ "${1:-}" == "--first-only" ]]; then
+        FIRST_ONLY=1
+        shift
+    fi
+
     local -a files=("$@")
     local -a rpm_paths=() spec_names=()
     local item
@@ -1708,6 +1721,10 @@ install_rpm_files_group() {
             spec_names+=("$item")
         fi
     done
+
+    if (( FIRST_ONLY == 1 )) && (( ${#rpm_paths[@]} > 1 )); then
+        rpm_paths=("${rpm_paths[0]}")
+    fi
 
     log "Групповая установка RPM: ${#files[@]} позиц. (файлов: ${#rpm_paths[@]}, спецификаций: ${#spec_names[@]})"
 
@@ -3826,6 +3843,32 @@ install_cryptopro_rpms_from_sources() {
         return 1
     fi
 
+    # v2.0.11: порядок установки как в официальном install.sh КриптоПро:
+    #   1) cprocsp-compat-altlinux-* (compat-слой, ставится первым);
+    #   2) lsb-cprocsp-base (базовый пакет);
+    #   3) остальные — одной группой (rdr/kc1/capilite/curl/ca-certs
+    #      взаимозависимы и должны резолвиться вместе).
+    local -a ordered=() compat_pkgs=() base_pkgs=() rest_pkgs=()
+    local bn
+    for f in "${files[@]}"; do
+        bn="$(basename "$f" | tr '[:upper:]' '[:lower:]')"
+        case "$bn" in
+            *compat*)              compat_pkgs+=("$f") ;;
+            *cprocsp-base*|*lsb-cprocsp-base*) base_pkgs+=("$f") ;;
+            *)                     rest_pkgs+=("$f") ;;
+        esac
+    done
+    ordered=(${compat_pkgs[@]+"${compat_pkgs[@]}"})
+    ordered+=(${base_pkgs[@]+"${base_pkgs[@]}"})
+    ordered+=(${rest_pkgs[@]+"${rest_pkgs[@]}"})
+    files=("${ordered[@]}")
+
+    # compat-пакет — отдельно, строго до остальных
+    if (( ${#compat_pkgs[@]} > 0 )); then
+        install_rpm_files_group --first-only "${compat_pkgs[@]}" || \
+            step_warn "CryptoPro compat-пакет не установился (продолжаю с остальными)"
+    fi
+
     if install_rpm_files_group "${files[@]}"; then
         info "CryptoPro RPM установлены группой из локальных источников: ${#files[@]}"
         return 0
@@ -4127,7 +4170,16 @@ install_component_from_dir() {
 
     info "Компонент «$name»: сканирую $root"
 
-    # 1) RPM компонента — группой (умный режим сам отфильтрует установленное)
+    local lower_lc_name
+    lower_lc_name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+    local is_cryptopro_comp=0
+    if [[ "$lower_lc_name" == *"крипто"* || "$lower_lc_name" == *"crypto"* || "$lower_lc_name" == *cprocsp* ]]; then
+        is_cryptopro_comp=1
+    fi
+
+    # 1) RPM компонента — группой (умный режим сам отфильтрует установленное).
+    #    Для КриптоПро: сначала compat-пакет, затем base, затем остальные
+    #    одной группой — как в официальном install.sh вендора.
     local -a comp_rpms=()
     local rf
     while IFS= read -r -d '' rf; do
@@ -4135,7 +4187,31 @@ install_component_from_dir() {
     done < <(find "$root" -maxdepth 3 -type f -iname '*.rpm' -print0 2>/dev/null | sort -z)
 
     if (( ${#comp_rpms[@]} > 0 )); then
-        if install_rpm_files_group "${comp_rpms[@]}"; then
+        if (( is_cryptopro_comp == 1 )); then
+            local -a cp_compat=() cp_base=() cp_rest=()
+            local cbn
+            for rf in "${comp_rpms[@]}"; do
+                cbn="$(basename "$rf" | tr '[:upper:]' '[:lower:]')"
+                case "$cbn" in
+                    *compat*)                      cp_compat+=("$rf") ;;
+                    *cprocsp-base*|*lsb-cprocsp-base*) cp_base+=("$rf") ;;
+                    *)                             cp_rest+=("$rf") ;;
+                esac
+            done
+            if (( ${#cp_compat[@]} > 0 )); then
+                install_rpm_files_group --first-only "${cp_compat[@]}" || \
+                    step_warn "Компонент «$name»: compat-пакет не установился (продолжаю)"
+            fi
+            if (( ${#cp_base[@]} > 0 )); then
+                install_rpm_files_group "${cp_base[@]}" || \
+                    step_warn "Компонент «$name»: base-пакет не установился (продолжаю)"
+            fi
+            if (( ${#cp_rest[@]} > 0 )); then
+                install_rpm_files_group "${cp_rest[@]}" || \
+                    step_warn "Компонент «$name»: часть RPM не установилась"
+            fi
+            did_something=1
+        elif install_rpm_files_group "${comp_rpms[@]}"; then
             info "Компонент «$name»: RPM обработаны (${#comp_rpms[@]} шт.)"
             did_something=1
         else
